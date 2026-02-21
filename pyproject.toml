@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pm1h-edge-trader"
+version = "0.1.0"
+description = "Minimal MVP scaffold for PM-1H Edge Trader."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client",
+]
+
+[project.scripts]
+pm1h-edge-trader = "pm1h_edge_trader.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

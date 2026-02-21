@@ -1,0 +1,2 @@
+[console_scripts]
+pm1h-edge-trader = pm1h_edge_trader.main:main

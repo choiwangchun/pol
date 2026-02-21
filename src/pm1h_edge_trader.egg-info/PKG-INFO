@@ -1,0 +1,59 @@
+Metadata-Version: 2.4
+Name: pm1h-edge-trader
+Version: 0.1.0
+Summary: Minimal MVP scaffold for PM-1H Edge Trader.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+# PM-1H Edge Trader (MVP)
+
+Polymarket BTC 1H Up/Down market에서 Binance 기반 공정확률 `q`를 계산하고,
+`ask/bid` 대비 엣지를 기준으로 dry-run 주문 의사결정을 수행하는 MVP입니다.
+
+## 핵심 구현 범위
+
+- Gamma API 기반 활성 BTC 1H 시장 자동 탐색 (`rules/resolution` 검증 포함)
+- CLOB 오더북(top-of-book) + Binance 1H `open(K)`/실시간 `S_t` 피드
+- 확률 엔진: `q_up = P(S_T >= K)` (로그정규 근사, RV/IV 혼합)
+- 엣지 필터 + Fractional Kelly 사이징
+- limit intent 실행 엔진(취소/재호가/near-expiry block/kill-switch)
+- CSV 실행 로그(`logs/executions.csv`)
+
+## 실행
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+pm1h-edge-trader --help
+```
+
+한 사이클 dry-run:
+
+```bash
+PYTHONPATH=src python -m pm1h_edge_trader.main \
+  --mode dry-run \
+  --max-ticks 1 \
+  --disable-websocket
+```
+
+특정 시장을 강제 지정하려면:
+
+```bash
+PYTHONPATH=src python -m pm1h_edge_trader.main \
+  --mode dry-run \
+  --market-slug bitcoin-up-or-down-february-16-1am-et \
+  --max-ticks 1
+```
+
+## 테스트
+
+```bash
+python3 -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
+python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+## 참고
+
+- 현재 CLI는 `dry-run`만 지원합니다 (`live`는 인증 주문 어댑터 연동 전 비활성).
+- 활성 BTC 1H Up/Down 시장이 없는 시점에는 discovery 단계에서 종료됩니다.

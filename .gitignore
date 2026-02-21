@@ -1,0 +1,24 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime logs and local outputs
+logs/
+*.log
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+
+# Virtual environments
+.venv/
+.venv.broken-*/
+
+# OS/editor artifacts
+.DS_Store
