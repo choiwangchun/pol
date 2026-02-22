@@ -38,6 +38,8 @@ class LimitOrderExecutionEngine:
         self._safety_guard = SafetyGuard(self._config)
         self._kill_switch = KillSwitchState()
         self._active_intents: dict[tuple[str, Side], ActiveIntent] = {}
+        self._filled_entries_by_market: dict[str, int] = {}
+        self._counted_filled_orders: set[str] = set()
 
     @property
     def kill_switch(self) -> KillSwitchState:
@@ -48,6 +50,31 @@ class LimitOrderExecutionEngine:
 
     def reset_kill_switch(self) -> None:
         self._kill_switch = KillSwitchState()
+
+    def mark_order_filled(self, order_id: str) -> bool:
+        """Marks an order as filled and clears its active intent."""
+        normalized = order_id.strip()
+        if not normalized:
+            return False
+
+        marked = False
+        mark_filled = getattr(self._adapter, "mark_filled", None)
+        if callable(mark_filled):
+            marked = bool(mark_filled(normalized))
+
+        for key, active in list(self._active_intents.items()):
+            if active.order_id != normalized:
+                continue
+            active.status = OrderStatus.FILLED
+            self._active_intents.pop(key, None)
+            if normalized not in self._counted_filled_orders:
+                self._filled_entries_by_market[active.market_id] = (
+                    self._filled_entries_by_market.get(active.market_id, 0) + 1
+                )
+                self._counted_filled_orders.add(normalized)
+            marked = True
+
+        return marked
 
     def process_signal(
         self,
@@ -150,6 +177,18 @@ class LimitOrderExecutionEngine:
         return actions
 
     def _maybe_place(self, *, signal: IntentSignal, now: datetime) -> list[ExecutionAction]:
+        entry_limit = self._config.max_entries_per_market
+        filled_entries = self._filled_entries_by_market.get(signal.market_id, 0)
+        if entry_limit > 0 and filled_entries >= entry_limit:
+            return [
+                ExecutionAction(
+                    action_type=ExecutionActionType.SKIP,
+                    market_id=signal.market_id,
+                    side=signal.side,
+                    reason="market_entry_limit",
+                )
+            ]
+
         if signal.size <= 0.0:
             return [
                 ExecutionAction(

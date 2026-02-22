@@ -28,11 +28,13 @@ class MvpValidationIntegrationTests(unittest.TestCase):
         *,
         max_data_age_s: float = 3.0,
         fee_must_be_zero: bool = True,
+        max_entries_per_market: int = 1,
     ) -> LimitOrderExecutionEngine:
         config = ExecutionConfig(
             max_data_age_s=max_data_age_s,
             fee_must_be_zero=fee_must_be_zero,
             entry_block_window_s=60,
+            max_entries_per_market=max_entries_per_market,
         )
         now = datetime(2026, 2, 16, tzinfo=timezone.utc)
         adapter = DryRunExecutionAdapter(id_prefix="it", now_fn=lambda: now)
@@ -180,6 +182,31 @@ class MvpValidationIntegrationTests(unittest.TestCase):
         self.assertEqual(len(result.actions), 1)
         self.assertEqual(result.actions[0].action_type, ExecutionActionType.SKIP)
         self.assertEqual(result.actions[0].reason, "invalid_desired_price")
+
+    def test_market_entry_limit_blocks_second_fill_entry(self) -> None:
+        engine = self._engine(max_entries_per_market=1)
+        first = engine.process_signal(self._signal(edge=0.03, min_edge=0.01), self._safety())
+        first_order_id = first.actions[0].order_id
+        assert first_order_id is not None
+
+        engine.mark_order_filled(first_order_id)
+        second_signal = IntentSignal(
+            market_id="mkt-1",
+            token_id="token-down",
+            side=Side.SELL,
+            edge=0.03,
+            min_edge=0.01,
+            desired_price=0.45,
+            size=10.0,
+            seconds_to_expiry=600,
+            signal_ts=self._signal().signal_ts,
+            allow_entry=True,
+        )
+        second = engine.process_signal(second_signal, self._safety())
+
+        self.assertEqual(len(second.actions), 1)
+        self.assertEqual(second.actions[0].action_type, ExecutionActionType.SKIP)
+        self.assertEqual(second.actions[0].reason, "market_entry_limit")
 
 
 if __name__ == "__main__":

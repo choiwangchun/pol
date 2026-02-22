@@ -50,6 +50,42 @@ def _record(
 
 
 class PaperResultTrackerTests(unittest.TestCase):
+    def test_available_bankroll_subtracts_unsettled_notional(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            result_path = Path(tmp_dir) / "result.json"
+            tracker = PaperResultTracker(initial_bankroll=1000.0, result_json_path=result_path)
+            tracker.write_snapshot()
+
+            self.assertEqual(tracker.available_bankroll(), 1000.0)
+
+            tracker.on_record(_record(status="paper_fill", order_id="ord-1", price=0.6, size=100.0))
+            self.assertEqual(tracker.available_bankroll(), 940.0)
+            self.assertEqual(tracker.market_entry_count("m1"), 1)
+            self.assertEqual(tracker.market_unsettled_notional("m1"), 60.0)
+
+            tracker.on_record(
+                _record(
+                    status="paper_settle",
+                    order_id="ord-1",
+                    price=0.6,
+                    size=100.0,
+                    pnl=25.0,
+                    settlement_outcome="win",
+                )
+            )
+            self.assertEqual(tracker.available_bankroll(), 1025.0)
+            self.assertEqual(tracker.market_unsettled_notional("m1"), 0.0)
+            self.assertEqual(tracker.daily_realized_pnl(datetime(2026, 2, 20, tzinfo=timezone.utc)), 25.0)
+
+    def test_available_bankroll_is_clamped_to_zero(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            result_path = Path(tmp_dir) / "result.json"
+            tracker = PaperResultTracker(initial_bankroll=100.0, result_json_path=result_path)
+            tracker.write_snapshot()
+
+            tracker.on_record(_record(status="paper_fill", order_id="ord-1", price=0.95, size=200.0))
+            self.assertEqual(tracker.available_bankroll(), 0.0)
+
     def test_updates_balance_on_fill_and_settlement_and_overwrites_json(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             result_path = Path(tmp_dir) / "result.json"

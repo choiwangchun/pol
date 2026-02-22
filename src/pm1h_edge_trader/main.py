@@ -90,6 +90,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Execution buffer subtracted from fair probability.",
     )
     parser.add_argument(
+        "--cost-rate",
+        type=float,
+        default=0.005,
+        help="Per-side cost haircut applied to q-ask edge (probability points).",
+    )
+    parser.add_argument(
         "--kelly-fraction",
         type=float,
         default=0.25,
@@ -101,6 +107,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=5.0,
         help="Minimum order notional in quote currency.",
+    )
+    parser.add_argument(
+        "--max-market-notional",
+        type=float,
+        default=None,
+        help="Hard cap for unsettled notional in a single market. Default: 25% of bankroll.",
+    )
+    parser.add_argument(
+        "--max-daily-loss",
+        type=float,
+        default=None,
+        help="Hard cap for realized daily loss. Default: 20% of bankroll.",
+    )
+    parser.add_argument(
+        "--max-entries-per-market",
+        type=int,
+        default=1,
+        help="Maximum number of fills allowed per market.",
     )
     parser.add_argument(
         "--rv-fallback",
@@ -233,6 +257,8 @@ class PM1HEdgeTraderApp:
             edge_min=config.decision.edge_min,
             edge_buffer_up=config.decision.edge_buffer_up,
             edge_buffer_down=config.decision.edge_buffer_down,
+            cost_rate_up=config.decision.cost_rate_up,
+            cost_rate_down=config.decision.cost_rate_down,
             kelly_fraction=config.risk.kelly_fraction,
             f_cap=config.risk.f_cap,
             min_order_size=config.risk.min_order_notional,
@@ -247,6 +273,7 @@ class PM1HEdgeTraderApp:
             max_clock_drift_s=config.safety.max_clock_drift_seconds,
             require_book_match=config.safety.require_book_match,
             fee_must_be_zero=config.safety.fee_must_be_zero,
+            max_entries_per_market=config.risk.max_entries_per_market,
             latch_kill_switch=config.safety.kill_switch_latch,
         )
         adapter = (
@@ -441,6 +468,7 @@ class PM1HEdgeTraderApp:
 
         decision: DecisionOutcome | None = None
         sigma = self._config.volatility.rv_fallback
+        entry_block_reason = self._entry_block_reason(now=now, market_id=market.market_id)
         if data_ready and tau_years > 0.0:
             sigma = await self._rv_estimator.get_sigma(now=now)
             decision = self._probability_engine.decide(
@@ -451,7 +479,7 @@ class PM1HEdgeTraderApp:
                 iv=self._config.volatility.iv_override,
                 ask_up=up_quote.best_ask or 0.0,
                 ask_down=down_quote.best_ask or 0.0,
-                bankroll=self._config.risk.bankroll,
+                bankroll=self._decision_bankroll(),
             )
             sigma = decision.sigma
 
@@ -471,6 +499,7 @@ class PM1HEdgeTraderApp:
             quote=up_quote,
             decision=decision,
             data_ready=data_ready,
+            entry_block_reason=entry_block_reason,
         )
         down_signal = self._build_signal(
             market_id=market.market_id,
@@ -481,6 +510,7 @@ class PM1HEdgeTraderApp:
             quote=down_quote,
             decision=decision,
             data_ready=data_ready,
+            entry_block_reason=entry_block_reason,
         )
 
         all_actions: list[ExecutionAction] = []
@@ -548,8 +578,10 @@ class PM1HEdgeTraderApp:
         quote: BestQuote | None,
         decision: DecisionOutcome | None,
         data_ready: bool,
+        entry_block_reason: str | None = None,
     ) -> IntentSignal:
         side = Side.BUY if side_label == "up" else Side.SELL
+        allow_entry = data_ready and entry_block_reason is None
         if decision is None or quote is None or quote.best_ask is None:
             return IntentSignal(
                 market_id=market_id,
@@ -561,7 +593,7 @@ class PM1HEdgeTraderApp:
                 size=0.0,
                 seconds_to_expiry=max(seconds_to_expiry, 0.0),
                 signal_ts=now,
-                allow_entry=False,
+                allow_entry=allow_entry,
             )
 
         side_intent = decision.up if side_label == "up" else decision.down
@@ -577,7 +609,11 @@ class PM1HEdgeTraderApp:
         )
         share_size = 0.0
         if side_intent.order_size > 0.0 and desired_price is not None and desired_price > 0.0:
-            share_size = side_intent.order_size / desired_price
+            capped_notional = self._cap_order_notional_for_market(
+                market_id=market_id,
+                suggested_notional=side_intent.order_size,
+            )
+            share_size = capped_notional / desired_price
 
         return IntentSignal(
             market_id=market_id,
@@ -589,7 +625,7 @@ class PM1HEdgeTraderApp:
             size=share_size,
             seconds_to_expiry=max(seconds_to_expiry, 0.0),
             signal_ts=now,
-            allow_entry=data_ready,
+            allow_entry=allow_entry,
         )
 
     def _report_action(
@@ -639,6 +675,7 @@ class PM1HEdgeTraderApp:
             down_quote=down_quote,
         )
         if paper_fill_record is not None:
+            self._execution_engine.mark_order_filled(paper_fill_record.order_id)
             self._reporter.append(paper_fill_record)
             if self._paper_result_tracker is not None:
                 self._paper_result_tracker.on_record(paper_fill_record)
@@ -768,6 +805,39 @@ class PM1HEdgeTraderApp:
             raise RuntimeError("underlying feed not initialized")
         return self._underlying
 
+    def _decision_bankroll(self) -> float:
+        tracker = self._paper_result_tracker
+        if tracker is None:
+            return self._config.risk.bankroll
+        return tracker.available_bankroll()
+
+    def _entry_block_reason(self, *, now: datetime, market_id: str) -> str | None:
+        tracker = self._paper_result_tracker
+        if tracker is None:
+            return None
+
+        daily_loss_cap = self._config.risk.max_daily_loss
+        if daily_loss_cap > 0.0:
+            daily_realized = tracker.daily_realized_pnl(now)
+            if daily_realized <= -daily_loss_cap:
+                return "daily_loss_cap_reached"
+
+        entry_limit = self._config.risk.max_entries_per_market
+        if entry_limit > 0 and tracker.market_entry_count(market_id) >= entry_limit:
+            return "market_entry_limit"
+
+        return None
+
+    def _cap_order_notional_for_market(self, *, market_id: str, suggested_notional: float) -> float:
+        capped = max(0.0, suggested_notional)
+        market_cap = self._config.risk.max_market_notional
+        if market_cap <= 0.0:
+            return capped
+        tracker = self._paper_result_tracker
+        used_notional = tracker.market_unsettled_notional(market_id) if tracker is not None else 0.0
+        remaining = max(0.0, market_cap - used_notional)
+        return min(capped, remaining)
+
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
@@ -800,9 +870,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         bankroll=args.bankroll,
         edge_min=args.edge_min,
         edge_buffer=args.edge_buffer,
+        cost_rate=args.cost_rate,
         kelly_fraction=args.kelly_fraction,
         f_cap=args.f_cap,
         min_order_notional=args.min_order_notional,
+        max_market_notional=args.max_market_notional,
+        max_daily_loss=args.max_daily_loss,
+        max_entries_per_market=args.max_entries_per_market,
         rv_fallback=args.rv_fallback,
         sigma_weight=args.sigma_weight,
         iv_override=args.iv,

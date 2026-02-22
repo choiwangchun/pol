@@ -45,6 +45,8 @@ class DecisionConfig:
     edge_min: float = 0.0
     edge_buffer_up: float = 0.0
     edge_buffer_down: float = 0.0
+    cost_rate_up: float = 0.0
+    cost_rate_down: float = 0.0
     kelly_fraction: float = 0.5
     f_cap: float = 0.1
     min_order_size: float = 0.0
@@ -113,6 +115,8 @@ def evaluate_edges(
     ask_up: float,
     ask_down: float,
     *,
+    cost_up: float = 0.0,
+    cost_down: float = 0.0,
     buffer_up: float = 0.0,
     buffer_down: float = 0.0,
 ) -> EdgeResult:
@@ -121,11 +125,13 @@ def evaluate_edges(
     _validate_probability("q_down", q_down)
     _validate_probability("ask_up", ask_up)
     _validate_probability("ask_down", ask_down)
+    _validate_non_negative("cost_up", cost_up)
+    _validate_non_negative("cost_down", cost_down)
     _validate_non_negative("buffer_up", buffer_up)
     _validate_non_negative("buffer_down", buffer_down)
 
-    edge_up = q_up - ask_up
-    edge_down = q_down - ask_down
+    edge_up = q_up - ask_up - cost_up
+    edge_down = q_down - ask_down - cost_down
     return EdgeResult(
         edge_up=edge_up,
         edge_down=edge_down,
@@ -210,6 +216,8 @@ class DecisionEngine:
             q_down=q_down,
             ask_up=ask_up,
             ask_down=ask_down,
+            cost_up=self.config.cost_rate_up,
+            cost_down=self.config.cost_rate_down,
             buffer_up=self.config.edge_buffer_up,
             buffer_down=self.config.edge_buffer_down,
         )

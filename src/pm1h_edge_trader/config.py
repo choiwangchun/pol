@@ -59,6 +59,8 @@ class DecisionConfig:
     edge_min: float = 0.015
     edge_buffer_up: float = 0.010
     edge_buffer_down: float = 0.010
+    cost_rate_up: float = 0.0
+    cost_rate_down: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -67,6 +69,9 @@ class RiskConfig:
     kelly_fraction: float = 0.25
     f_cap: float = 0.05
     min_order_notional: float = 5.0
+    max_market_notional: float = 2_500.0
+    max_daily_loss: float = 2_000.0
+    max_entries_per_market: int = 1
 
 
 @dataclass(slots=True, frozen=True)
@@ -142,10 +147,21 @@ def build_config(
     iv_override: float | None,
     log_dir: Path,
     enable_websocket: bool,
+    cost_rate: float = 0.005,
+    max_market_notional: float | None = None,
+    max_daily_loss: float | None = None,
+    max_entries_per_market: int = 1,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
 ) -> AppConfig:
     """Constructs an app config from CLI inputs."""
+    market_notional_cap = max_market_notional
+    if market_notional_cap is None:
+        market_notional_cap = max(0.0, bankroll * 0.25)
+    daily_loss_cap = max_daily_loss
+    if daily_loss_cap is None:
+        daily_loss_cap = max(0.0, bankroll * 0.20)
+
     return AppConfig(
         mode=mode,
         fresh_start=fresh_start,
@@ -161,12 +177,17 @@ def build_config(
             edge_min=edge_min,
             edge_buffer_up=edge_buffer,
             edge_buffer_down=edge_buffer,
+            cost_rate_up=max(0.0, cost_rate),
+            cost_rate_down=max(0.0, cost_rate),
         ),
         risk=RiskConfig(
             bankroll=bankroll,
             kelly_fraction=kelly_fraction,
             f_cap=f_cap,
             min_order_notional=min_order_notional,
+            max_market_notional=max(0.0, market_notional_cap),
+            max_daily_loss=max(0.0, daily_loss_cap),
+            max_entries_per_market=max(1, max_entries_per_market),
         ),
         loop=LoopConfig(
             tick_seconds=tick_seconds,

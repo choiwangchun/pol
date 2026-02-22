@@ -57,6 +57,22 @@ class MathEngineTests(unittest.TestCase):
         _assert_close(self, edge.edge_down, -0.02)
         _assert_close(self, edge.edge_down_after_buffer, -0.04)
 
+    def test_evaluate_edges_applies_cost_before_buffer(self) -> None:
+        edge = evaluate_edges(
+            q_up=0.60,
+            q_down=0.40,
+            ask_up=0.55,
+            ask_down=0.35,
+            cost_up=0.01,
+            cost_down=0.02,
+            buffer_up=0.005,
+            buffer_down=0.005,
+        )
+        _assert_close(self, edge.edge_up, 0.04)
+        _assert_close(self, edge.edge_up_after_buffer, 0.035)
+        _assert_close(self, edge.edge_down, 0.03)
+        _assert_close(self, edge.edge_down_after_buffer, 0.025)
+
 
     def test_fractional_kelly_and_cap(self) -> None:
         f = fractional_kelly(q=0.60, c=0.55, kelly_fraction=0.5, f_cap=0.2)

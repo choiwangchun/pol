@@ -123,6 +123,7 @@ class ExecutionConfig:
     max_clock_drift_s: float = 1.0
     require_book_match: bool = True
     fee_must_be_zero: bool = True
+    max_entries_per_market: int = 1
     price_epsilon: float = 1e-9
     latch_kill_switch: bool = True
 
