@@ -10,9 +10,9 @@ import os
 import signal
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from math import log, sqrt
+from math import ceil, log, sqrt
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 from .config import (
     AppConfig,
@@ -30,6 +30,7 @@ from .execution import (
     ExecutionActionType,
     ExecutionConfig as ExecutionEngineConfig,
     IntentSignal,
+    KillSwitchReason,
     LimitOrderExecutionEngine,
     PolymarketLiveExecutionAdapter,
     SafetySurface,
@@ -133,6 +134,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fallback annualized RV when estimator fails.",
     )
     parser.add_argument(
+        "--rv-interval",
+        default="1h",
+        help="Binance kline interval used for long-horizon RV (e.g. 1h, 15m, 5m).",
+    )
+    parser.add_argument(
+        "--rv-ewma-half-life",
+        type=float,
+        default=0.0,
+        help="EWMA half-life in periods for long-horizon RV. 0 disables EWMA.",
+    )
+    parser.add_argument(
+        "--rv-short-interval",
+        default="5m",
+        help="Binance kline interval used for short-horizon RV.",
+    )
+    parser.add_argument(
+        "--rv-short-lookback-hours",
+        type=int,
+        default=12,
+        help="Lookback window in hours for short-horizon RV.",
+    )
+    parser.add_argument(
+        "--rv-short-ewma-half-life",
+        type=float,
+        default=18.0,
+        help="EWMA half-life in periods for short-horizon RV.",
+    )
+    parser.add_argument(
+        "--rv-tau-switch-seconds",
+        type=float,
+        default=1800.0,
+        help="Time-to-expiry threshold where RV blend shifts toward short horizon.",
+    )
+    parser.add_argument(
         "--sigma-weight",
         type=float,
         default=1.0,
@@ -143,6 +178,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Optional implied volatility override (annualized, decimal).",
+    )
+    parser.add_argument(
+        "--enable-deribit-iv",
+        action="store_true",
+        help="Enable Deribit DVOL feed as dynamic IV source when --iv is not provided.",
+    )
+    parser.add_argument(
+        "--deribit-iv-resolution-minutes",
+        type=int,
+        default=60,
+        help="Deribit DVOL candle resolution in minutes.",
+    )
+    parser.add_argument(
+        "--deribit-iv-lookback-hours",
+        type=int,
+        default=48,
+        help="Lookback window for Deribit DVOL sampling.",
+    )
+    parser.add_argument(
+        "--deribit-iv-refresh-seconds",
+        type=float,
+        default=60.0,
+        help="Refresh cadence for Deribit DVOL polling.",
     )
     parser.add_argument(
         "--disable-websocket",
@@ -183,7 +241,7 @@ class FeeState:
 
 
 class RealizedVolEstimator:
-    """Computes annualized realized volatility from Binance 1h closes."""
+    """Computes annualized realized volatility from Binance kline closes."""
 
     def __init__(
         self,
@@ -195,16 +253,23 @@ class RealizedVolEstimator:
         refresh_seconds: float,
         fallback_sigma: float,
         floor_sigma: float,
+        ewma_half_life: float = 0.0,
         http_client: AsyncJsonHttpClient | None = None,
     ) -> None:
         self._rest_base_url = rest_base_url.rstrip("/")
         self._symbol = symbol.upper()
         self._interval = interval
-        self._lookback_hours = max(8, lookback_hours)
+        self._interval_seconds = _interval_to_seconds(interval)
+        self._lookback_hours = max(1, lookback_hours)
         self._refresh_seconds = max(5.0, refresh_seconds)
         self._fallback_sigma = max(fallback_sigma, floor_sigma)
         self._floor_sigma = max(0.0, floor_sigma)
+        self._ewma_half_life = max(0.0, ewma_half_life)
         self._http = http_client or AsyncJsonHttpClient()
+        self._kline_limit = _compute_kline_limit(
+            lookback_hours=self._lookback_hours,
+            interval_seconds=self._interval_seconds,
+        )
         self._cached_sigma: float = self._fallback_sigma
         self._cached_at: datetime | None = None
 
@@ -226,20 +291,116 @@ class RealizedVolEstimator:
                 params={
                     "symbol": self._symbol,
                     "interval": self._interval,
-                    "limit": self._lookback_hours + 1,
+                    "limit": self._kline_limit,
                 },
             )
             closes = _extract_closes(rows)
             returns = _log_returns(closes)
             if len(returns) < 2:
                 return self._fallback_sigma
-            hourly_vol = _sample_std(returns)
-            annualized = hourly_vol * sqrt(24.0 * 365.0)
+            period_vol = (
+                _ewma_std(returns, half_life=self._ewma_half_life)
+                if self._ewma_half_life > 0.0
+                else _sample_std(returns)
+            )
+            annualized = period_vol * sqrt(SECONDS_PER_YEAR / float(self._interval_seconds))
             if annualized <= 0.0:
                 return self._fallback_sigma
             return annualized
         except Exception:
             return self._fallback_sigma
+
+
+class AdaptiveRealizedVolEstimator:
+    """Blends long/short RV horizons based on time-to-expiry."""
+
+    def __init__(
+        self,
+        *,
+        long_horizon: RealizedVolEstimator,
+        short_horizon: RealizedVolEstimator,
+        tau_switch_seconds: float,
+        floor_sigma: float,
+        fallback_sigma: float,
+    ) -> None:
+        self._long_horizon = long_horizon
+        self._short_horizon = short_horizon
+        self._tau_switch_seconds = max(1.0, tau_switch_seconds)
+        self._floor_sigma = max(0.0, floor_sigma)
+        self._fallback_sigma = max(fallback_sigma, self._floor_sigma)
+
+    async def get_sigma(self, *, now: datetime, seconds_to_expiry: float) -> float:
+        try:
+            long_sigma = await self._long_horizon.get_sigma(now=now)
+            short_sigma = await self._short_horizon.get_sigma(now=now)
+            weight_short = _tau_short_weight(seconds_to_expiry, self._tau_switch_seconds)
+            variance = ((1.0 - weight_short) * (long_sigma**2)) + (weight_short * (short_sigma**2))
+            sigma = sqrt(max(variance, 0.0))
+            if sigma <= 0.0:
+                return self._fallback_sigma
+            return max(self._floor_sigma, sigma)
+        except Exception:
+            return self._fallback_sigma
+
+
+class DeribitVolatilityIndexEstimator:
+    """Polls Deribit volatility-index candles and returns latest annualized IV."""
+
+    def __init__(
+        self,
+        *,
+        currency: str,
+        resolution_minutes: int,
+        lookback_hours: int,
+        refresh_seconds: float,
+        floor: float,
+        cap: float,
+        http_client: AsyncJsonHttpClient | None = None,
+    ) -> None:
+        self._currency = currency.upper()
+        self._resolution_minutes = max(1, resolution_minutes)
+        self._lookback_hours = max(1, lookback_hours)
+        self._refresh_seconds = max(5.0, refresh_seconds)
+        self._floor = max(0.0, floor)
+        self._cap = max(self._floor, cap)
+        self._http = http_client or AsyncJsonHttpClient()
+        self._cached_iv: float | None = None
+        self._cached_at: datetime | None = None
+
+    async def get_iv(self, *, now: datetime) -> float | None:
+        if self._cached_at is not None:
+            age_s = (now - self._cached_at).total_seconds()
+            if age_s <= self._refresh_seconds:
+                return self._cached_iv
+
+        fetched = await self._fetch_with_fallback(now=now)
+        self._cached_iv = fetched
+        self._cached_at = now
+        return self._cached_iv
+
+    async def _fetch_with_fallback(self, *, now: datetime) -> float | None:
+        try:
+            end_ms = int(now.timestamp() * 1000)
+            start_ms = int((now - timedelta(hours=self._lookback_hours)).timestamp() * 1000)
+            payload = await self._http.get_json(
+                "https://www.deribit.com/api/v2/public/get_volatility_index_data",
+                params={
+                    "currency": self._currency,
+                    "resolution": str(self._resolution_minutes),
+                    "start_timestamp": start_ms,
+                    "end_timestamp": end_ms,
+                },
+            )
+            close = _extract_deribit_iv_close(payload)
+            if close is None:
+                return None
+            as_decimal = close / 100.0 if close > 3.0 else close
+            clamped = min(self._cap, max(self._floor, as_decimal))
+            if clamped <= 0.0:
+                return None
+            return clamped
+        except Exception:
+            return self._cached_iv
 
 
 class PM1HEdgeTraderApp:
@@ -289,15 +450,43 @@ class PM1HEdgeTraderApp:
             config=execution_cfg,
         )
 
-        self._rv_estimator = RealizedVolEstimator(
+        rv_long_estimator = RealizedVolEstimator(
             rest_base_url=config.binance.rest_base_url,
             symbol=config.binance.symbol,
-            interval=config.binance.interval,
+            interval=config.volatility.rv_interval,
             lookback_hours=config.volatility.rv_lookback_hours,
             refresh_seconds=config.volatility.rv_refresh_seconds,
             fallback_sigma=config.volatility.rv_fallback,
             floor_sigma=config.volatility.rv_floor,
+            ewma_half_life=config.volatility.rv_ewma_half_life,
         )
+        rv_short_estimator = RealizedVolEstimator(
+            rest_base_url=config.binance.rest_base_url,
+            symbol=config.binance.symbol,
+            interval=config.volatility.rv_short_interval,
+            lookback_hours=config.volatility.rv_short_lookback_hours,
+            refresh_seconds=config.volatility.rv_refresh_seconds,
+            fallback_sigma=config.volatility.rv_fallback,
+            floor_sigma=config.volatility.rv_floor,
+            ewma_half_life=config.volatility.rv_short_ewma_half_life,
+        )
+        self._rv_estimator = AdaptiveRealizedVolEstimator(
+            long_horizon=rv_long_estimator,
+            short_horizon=rv_short_estimator,
+            tau_switch_seconds=config.volatility.rv_tau_switch_seconds,
+            floor_sigma=config.volatility.rv_floor,
+            fallback_sigma=config.volatility.rv_fallback,
+        )
+        self._iv_estimator: DeribitVolatilityIndexEstimator | None = None
+        if config.volatility.enable_deribit_iv and config.volatility.iv_override is None:
+            self._iv_estimator = DeribitVolatilityIndexEstimator(
+                currency=config.volatility.deribit_iv_currency,
+                resolution_minutes=config.volatility.deribit_iv_resolution_minutes,
+                lookback_hours=config.volatility.deribit_iv_lookback_hours,
+                refresh_seconds=config.volatility.deribit_iv_refresh_seconds,
+                floor=config.volatility.deribit_iv_floor,
+                cap=config.volatility.deribit_iv_cap,
+            )
 
         self._market: MarketCandidate | None = None
         self._orderbook: ClobOrderbookAdapter | None = None
@@ -307,6 +496,11 @@ class PM1HEdgeTraderApp:
         self._paper_result_tracker: PaperResultTracker | None = None
         self._paper_settlement_interval = timedelta(seconds=15)
         self._next_paper_settlement_check: datetime | None = None
+        self._token_tick_sizes: dict[str, float] = {}
+        self._near_expiry_cleanup_done = False
+        self._next_heartbeat_check: datetime | None = None
+        self._next_open_order_reconcile_check: datetime | None = None
+        self._external_kill_switch_latched = False
 
         if config.mode == RuntimeMode.DRY_RUN:
             resolver = PolymarketMarketResolutionResolver(
@@ -419,17 +613,25 @@ class PM1HEdgeTraderApp:
             await self._deactivate_market()
             raise
 
-        self._execution_engine.reset_kill_switch()
-        await self._refresh_fee_state(force=True, now=utc_now())
-        await self._reconcile_paper_settlements(force=True, now=utc_now())
+        now_ts = utc_now()
+        if not self._external_kill_switch_latched:
+            self._execution_engine.reset_kill_switch()
+        self._near_expiry_cleanup_done = False
+        self._set_market_tick_sizes(self._discover_market_tick_sizes(market))
+        self._next_heartbeat_check = now_ts
+        self._next_open_order_reconcile_check = now_ts
+        await self._refresh_fee_state(force=True, now=now_ts)
+        await self._reconcile_paper_settlements(force=True, now=now_ts)
         LOGGER.info(
-            "Selected market id=%s slug=%s start=%s end=%s up_token=%s down_token=%s",
+            "Selected market id=%s slug=%s start=%s end=%s up_token=%s down_token=%s tick_up=%s tick_down=%s",
             market.market_id,
             market.slug,
             market.timing.start.isoformat(),
             market.timing.end.isoformat(),
             market.token_ids.up_token_id,
             market.token_ids.down_token_id,
+            self._token_tick_sizes.get(market.token_ids.up_token_id),
+            self._token_tick_sizes.get(market.token_ids.down_token_id),
         )
         return True
 
@@ -447,6 +649,10 @@ class PM1HEdgeTraderApp:
         self._orderbook = None
         self._underlying = None
         self._fee_state = None
+        self._token_tick_sizes = {}
+        self._near_expiry_cleanup_done = False
+        self._next_heartbeat_check = None
+        self._next_open_order_reconcile_check = None
         self._market = None
 
     async def _tick_once(self, *, tick_count: int) -> bool:
@@ -454,6 +660,9 @@ class PM1HEdgeTraderApp:
         now = utc_now()
         if now >= market.timing.end:
             return True
+
+        self._run_live_heartbeat(now=now)
+        self._reconcile_live_open_orders(now=now)
 
         await self._refresh_fee_state(now=now)
         max_fee_rate = self._fee_state.max_fee_rate if self._fee_state is not None else 0.0
@@ -464,19 +673,31 @@ class PM1HEdgeTraderApp:
         down_quote = book.quotes.get(market.token_ids.down_token_id)
 
         data_ready = _is_data_ready(up_quote, down_quote, underlying)
-        tau_years = max((market.timing.end - now).total_seconds(), 0.0) / SECONDS_PER_YEAR
+        seconds_to_expiry = max((market.timing.end - now).total_seconds(), 0.0)
+        self._enforce_near_expiry_cleanup(
+            market_id=market.market_id,
+            seconds_to_expiry=seconds_to_expiry,
+            now=now,
+        )
+        tau_years = seconds_to_expiry / SECONDS_PER_YEAR
 
         decision: DecisionOutcome | None = None
         sigma = self._config.volatility.rv_fallback
+        dynamic_iv: float | None = self._config.volatility.iv_override
         entry_block_reason = self._entry_block_reason(now=now, market_id=market.market_id)
         if data_ready and tau_years > 0.0:
-            sigma = await self._rv_estimator.get_sigma(now=now)
+            sigma = await self._rv_estimator.get_sigma(
+                now=now,
+                seconds_to_expiry=seconds_to_expiry,
+            )
+            if dynamic_iv is None and self._iv_estimator is not None:
+                dynamic_iv = await self._iv_estimator.get_iv(now=now)
             decision = self._probability_engine.decide(
                 spot=underlying.last_price or 0.0,
                 strike=underlying.candle_open or 0.0,
                 tau=tau_years,
                 rv=sigma,
-                iv=self._config.volatility.iv_override,
+                iv=dynamic_iv,
                 ask_up=up_quote.best_ask or 0.0,
                 ask_down=down_quote.best_ask or 0.0,
                 bankroll=self._decision_bankroll(),
@@ -495,7 +716,7 @@ class PM1HEdgeTraderApp:
             token_id=market.token_ids.up_token_id,
             side_label="up",
             now=now,
-            seconds_to_expiry=(market.timing.end - now).total_seconds(),
+            seconds_to_expiry=seconds_to_expiry,
             quote=up_quote,
             decision=decision,
             data_ready=data_ready,
@@ -506,7 +727,7 @@ class PM1HEdgeTraderApp:
             token_id=market.token_ids.down_token_id,
             side_label="down",
             now=now,
-            seconds_to_expiry=(market.timing.end - now).total_seconds(),
+            seconds_to_expiry=seconds_to_expiry,
             quote=down_quote,
             decision=decision,
             data_ready=data_ready,
@@ -606,6 +827,7 @@ class PM1HEdgeTraderApp:
             ask=quote.best_ask,
             fair_probability=side_intent.probability,
             edge_buffer=edge_buffer,
+            tick_size=self._token_tick_sizes.get(quote.token_id),
         )
         share_size = 0.0
         if side_intent.order_size > 0.0 and desired_price is not None and desired_price > 0.0:
@@ -805,6 +1027,159 @@ class PM1HEdgeTraderApp:
             raise RuntimeError("underlying feed not initialized")
         return self._underlying
 
+    def _set_market_tick_sizes(self, tick_sizes: Mapping[str, float]) -> None:
+        normalized: dict[str, float] = {}
+        for token_id, tick in tick_sizes.items():
+            key = str(token_id).strip()
+            if not key:
+                continue
+            if tick <= 0.0:
+                continue
+            normalized[key] = tick
+        self._token_tick_sizes = normalized
+        if not normalized:
+            return
+        min_tick = min(normalized.values())
+        self._execution_engine.set_price_epsilon(max(min_tick / 2.0, 1e-9))
+
+    def _discover_market_tick_sizes(self, market: MarketCandidate) -> dict[str, float]:
+        resolved = _extract_tick_sizes_from_market(market)
+        adapter = self._execution_engine._adapter
+        for token_id in (market.token_ids.up_token_id, market.token_ids.down_token_id):
+            if token_id in resolved:
+                continue
+            tick_size = adapter.get_tick_size(token_id)
+            if tick_size is None or tick_size <= 0.0:
+                continue
+            resolved[token_id] = tick_size
+        return resolved
+
+    def _run_live_heartbeat(self, *, now: datetime, force: bool = False) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        if not force and self._next_heartbeat_check is not None and now < self._next_heartbeat_check:
+            return
+
+        heartbeat_ok = self._execution_engine._adapter.send_heartbeat()
+        if not heartbeat_ok:
+            self._trigger_external_kill_switch(
+                reason=KillSwitchReason.HEARTBEAT_FAILED,
+                now=now,
+                message="Heartbeat failed",
+            )
+
+        interval = max(1.0, self._config.safety.heartbeat_interval_seconds)
+        self._next_heartbeat_check = now + timedelta(seconds=interval)
+
+    def _reconcile_live_open_orders(self, *, now: datetime, force: bool = False) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        if not force and self._next_open_order_reconcile_check is not None and now < self._next_open_order_reconcile_check:
+            return
+
+        adapter = self._execution_engine._adapter
+        try:
+            venue_open_ids = adapter.list_open_order_ids()
+        except Exception:
+            self._trigger_external_kill_switch(
+                reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                now=now,
+                message="Open-order reconciliation failed",
+            )
+            interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
+            self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
+            return
+
+        local_open_ids = {intent.order_id for intent in self._execution_engine.active_intents().values()}
+        orphaned_ids = venue_open_ids - local_open_ids
+        missing_ids = local_open_ids - venue_open_ids
+
+        for order_id in orphaned_ids:
+            try:
+                result = adapter.cancel_order(order_id)
+            except Exception:
+                self._trigger_external_kill_switch(
+                    reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                    now=now,
+                    message="Failed to cancel orphaned open order",
+                )
+                break
+            if result.canceled:
+                continue
+            self._trigger_external_kill_switch(
+                reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                now=now,
+                message="Found orphaned open order that could not be canceled",
+            )
+            break
+
+        for order_id in missing_ids:
+            self._execution_engine.drop_intent(order_id)
+
+        if orphaned_ids or missing_ids:
+            LOGGER.warning(
+                "open_order_reconciliation orphaned=%s missing=%s",
+                len(orphaned_ids),
+                len(missing_ids),
+            )
+
+        interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
+        self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
+
+    def _enforce_near_expiry_cleanup(
+        self,
+        *,
+        market_id: str,
+        seconds_to_expiry: float,
+        now: datetime,
+    ) -> bool:
+        if self._near_expiry_cleanup_done:
+            return False
+        threshold = max(0.0, self._config.safety.entry_block_window_seconds)
+        if seconds_to_expiry > threshold:
+            return False
+
+        try:
+            self._execution_engine.cancel_all_intents(reason="near_expiry_cleanup")
+        except Exception as exc:
+            LOGGER.warning("near_expiry_cleanup failed to cancel local intents: %s", exc)
+        if self._config.mode == RuntimeMode.LIVE:
+            self._cancel_all_venue_orders(now=now)
+        self._near_expiry_cleanup_done = True
+        LOGGER.info("near_expiry_cleanup_applied market_id=%s seconds_to_expiry=%.2f", market_id, seconds_to_expiry)
+        return True
+
+    def _cancel_all_venue_orders(self, *, now: datetime) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        try:
+            canceled_count = self._execution_engine._adapter.cancel_all_orders()
+        except Exception:
+            self._trigger_external_kill_switch(
+                reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                now=now,
+                message="cancel_all_orders failed",
+            )
+            return
+        LOGGER.warning("cancel_all_orders_applied count=%s", canceled_count)
+
+    def _trigger_external_kill_switch(
+        self,
+        *,
+        reason: KillSwitchReason,
+        now: datetime,
+        message: str,
+    ) -> None:
+        if self._external_kill_switch_latched:
+            return
+        self._external_kill_switch_latched = True
+        try:
+            self._execution_engine.latch_kill_switch(reason=reason, now=now)
+        except Exception as exc:
+            LOGGER.warning("kill_switch_latch_local_cancel_failed: %s", exc)
+        self._cancel_all_venue_orders(now=now)
+        LOGGER.error("%s: kill switch latched.", message)
+
     def _decision_bankroll(self) -> float:
         tracker = self._paper_result_tracker
         if tracker is None:
@@ -812,6 +1187,9 @@ class PM1HEdgeTraderApp:
         return tracker.available_bankroll()
 
     def _entry_block_reason(self, *, now: datetime, market_id: str) -> str | None:
+        if self._external_kill_switch_latched:
+            return "external_kill_switch_latched"
+
         tracker = self._paper_result_tracker
         if tracker is None:
             return None
@@ -878,8 +1256,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_daily_loss=args.max_daily_loss,
         max_entries_per_market=args.max_entries_per_market,
         rv_fallback=args.rv_fallback,
+        rv_interval=args.rv_interval,
+        rv_ewma_half_life=args.rv_ewma_half_life,
+        rv_short_interval=args.rv_short_interval,
+        rv_short_lookback_hours=args.rv_short_lookback_hours,
+        rv_short_ewma_half_life=args.rv_short_ewma_half_life,
+        rv_tau_switch_seconds=args.rv_tau_switch_seconds,
         sigma_weight=args.sigma_weight,
         iv_override=args.iv,
+        enable_deribit_iv=args.enable_deribit_iv,
+        deribit_iv_resolution_minutes=args.deribit_iv_resolution_minutes,
+        deribit_iv_lookback_hours=args.deribit_iv_lookback_hours,
+        deribit_iv_refresh_seconds=args.deribit_iv_refresh_seconds,
         log_dir=args.log_dir,
         enable_websocket=not args.disable_websocket,
         fresh_start=args.fresh_start,
@@ -895,6 +1283,80 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         LOGGER.info("Interrupted by user.")
     return 0
+
+
+def _interval_to_seconds(interval: str) -> int:
+    text = interval.strip().lower()
+    if len(text) < 2:
+        raise ValueError(f"Unsupported interval format: {interval!r}")
+    unit = text[-1]
+    magnitude_text = text[:-1]
+    try:
+        magnitude = int(magnitude_text)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported interval format: {interval!r}") from exc
+    if magnitude <= 0:
+        raise ValueError(f"Interval magnitude must be positive: {interval!r}")
+
+    if unit == "m":
+        return magnitude * 60
+    if unit == "h":
+        return magnitude * 60 * 60
+    if unit == "d":
+        return magnitude * 24 * 60 * 60
+    raise ValueError(f"Unsupported interval unit: {interval!r}")
+
+
+def _compute_kline_limit(*, lookback_hours: int, interval_seconds: int) -> int:
+    if interval_seconds <= 0:
+        return 9
+    lookback_seconds = max(1, lookback_hours) * 60 * 60
+    periods = max(2, int(ceil(lookback_seconds / interval_seconds)))
+    return max(9, periods + 1)
+
+
+def _ewma_std(values: Sequence[float], *, half_life: float) -> float:
+    if len(values) < 1:
+        return 0.0
+    if half_life <= 0.0:
+        return _sample_std(values)
+    decay = 0.5 ** (1.0 / half_life)
+    variance = 0.0
+    initialized = False
+    for value in values:
+        squared = value * value
+        if not initialized:
+            variance = squared
+            initialized = True
+            continue
+        variance = (decay * variance) + ((1.0 - decay) * squared)
+    return sqrt(max(variance, 0.0))
+
+
+def _tau_short_weight(seconds_to_expiry: float, tau_switch_seconds: float) -> float:
+    switch = max(tau_switch_seconds, 1e-9)
+    tte = max(seconds_to_expiry, 0.0)
+    raw = (switch - tte) / switch
+    return min(1.0, max(0.0, raw))
+
+
+def _extract_deribit_iv_close(payload: object) -> float | None:
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    rows = result.get("data")
+    if not isinstance(rows, list):
+        return None
+    for row in reversed(rows):
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        close = _safe_float(row[4])
+        if close is None or close <= 0.0:
+            continue
+        return close
+    return None
 
 
 def _extract_closes(payload: object) -> list[float]:
@@ -1012,14 +1474,21 @@ def _compute_clock_drift_seconds(*, now: datetime, underlying: UnderlyingSnapsho
     return max(future_offsets) if future_offsets else 0.0
 
 
-def _limit_price(*, ask: float, fair_probability: float, edge_buffer: float) -> float | None:
+def _limit_price(
+    *,
+    ask: float,
+    fair_probability: float,
+    edge_buffer: float,
+    tick_size: float | None = None,
+) -> float | None:
     target = fair_probability - edge_buffer
     if target <= 0.0:
         return None
     price = min(ask, target)
     # Bound to valid probability price ticks.
     bounded = min(0.999, max(0.001, price))
-    return round(bounded, 4)
+    tick = tick_size if tick_size is not None and tick_size > 0.0 else 0.0001
+    return _round_down_to_tick(bounded, tick)
 
 
 def _edge_for_action(action: ExecutionAction, decision: DecisionOutcome | None) -> float:
@@ -1065,6 +1534,74 @@ def _should_mark_dry_run_fill(*, limit_price: float, best_ask: float | None) -> 
     if best_ask is None:
         return False
     return (limit_price + 1e-9) >= best_ask
+
+
+def _round_down_to_tick(value: float, tick_size: float) -> float:
+    if tick_size <= 0.0:
+        return round(value, 4)
+    steps = int((value + 1e-12) / tick_size)
+    rounded = steps * tick_size
+    bounded = min(0.999, max(0.001, rounded))
+    precision = max(0, _decimal_places(tick_size))
+    return round(bounded, precision)
+
+
+def _decimal_places(value: float) -> int:
+    text = f"{value:.10f}".rstrip("0")
+    if "." not in text:
+        return 0
+    return len(text.split(".", maxsplit=1)[1])
+
+
+def _extract_tick_sizes_from_market(market: MarketCandidate) -> dict[str, float]:
+    tick_sizes: dict[str, float] = {}
+    raw = market.raw_market if isinstance(market.raw_market, Mapping) else {}
+    token_rows = raw.get("tokens")
+    if isinstance(token_rows, list):
+        for token in token_rows:
+            if not isinstance(token, Mapping):
+                continue
+            token_id = _extract_token_id(token)
+            tick_size = _extract_tick_size(token)
+            if token_id is None or tick_size is None:
+                continue
+            tick_sizes[token_id] = tick_size
+
+    default_tick = _extract_tick_size(raw)
+    if default_tick is not None:
+        for token_id in (market.token_ids.up_token_id, market.token_ids.down_token_id):
+            tick_sizes.setdefault(token_id, default_tick)
+
+    return tick_sizes
+
+
+def _extract_token_id(payload: Mapping[str, Any]) -> str | None:
+    for key in ("token_id", "tokenId", "clobTokenId", "asset_id", "id"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    return None
+
+
+def _extract_tick_size(payload: Mapping[str, Any]) -> float | None:
+    for key in (
+        "tickSize",
+        "tick_size",
+        "priceIncrement",
+        "price_increment",
+        "minPriceIncrement",
+        "min_price_increment",
+        "minimumTickSize",
+        "minimum_tick_size",
+        "minimumPriceIncrement",
+    ):
+        value = payload.get(key)
+        parsed = _safe_float(value)
+        if parsed is not None and parsed > 0.0:
+            return parsed
+    return None
 
 
 if __name__ == "__main__":

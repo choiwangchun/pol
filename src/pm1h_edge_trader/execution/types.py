@@ -36,6 +36,8 @@ class KillSwitchReason(str, Enum):
     DATA_STALE = "data_stale"
     CLOCK_DRIFT = "clock_drift"
     BOOK_MISMATCH = "book_mismatch"
+    HEARTBEAT_FAILED = "heartbeat_failed"
+    ORDER_RECONCILIATION_FAILED = "order_reconciliation_failed"
 
 
 @dataclass(frozen=True)

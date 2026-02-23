@@ -14,6 +14,18 @@ class ExecutionAdapter(Protocol):
     def cancel_order(self, order_id: str) -> CancelResult:
         """Cancel a previously submitted order."""
 
+    def list_open_order_ids(self) -> set[str]:
+        """Returns currently open order ids for reconciliation."""
+
+    def cancel_all_orders(self) -> int:
+        """Cancels all open orders and returns count best-effort."""
+
+    def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
+        """Sends venue heartbeat and returns whether it succeeded."""
+
+    def get_tick_size(self, token_id: str) -> float | None:
+        """Returns token tick size when available."""
+
 
 @dataclass
 class _DryRunOrder:
@@ -56,6 +68,24 @@ class DryRunExecutionAdapter(ExecutionAdapter):
             return None
         return order.status
 
+    def list_open_order_ids(self) -> set[str]:
+        return {order_id for order_id, order in self._orders.items() if order.status == OrderStatus.OPEN}
+
+    def cancel_all_orders(self) -> int:
+        canceled = 0
+        for order in self._orders.values():
+            if order.status != OrderStatus.OPEN:
+                continue
+            order.status = OrderStatus.CANCELED
+            canceled += 1
+        return canceled
+
+    def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
+        return True
+
+    def get_tick_size(self, token_id: str) -> float | None:
+        return 0.0001
+
 
 PlaceLimitOrderFn = Callable[[OrderRequest], OrderHandle]
 CancelOrderFn = Callable[[str], CancelResult]
@@ -78,3 +108,15 @@ class LiveExecutionAdapter(ExecutionAdapter):
 
     def cancel_order(self, order_id: str) -> CancelResult:
         return self._cancel_order_fn(order_id)
+
+    def list_open_order_ids(self) -> set[str]:
+        return set()
+
+    def cancel_all_orders(self) -> int:
+        return 0
+
+    def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
+        return True
+
+    def get_tick_size(self, token_id: str) -> float | None:
+        return None

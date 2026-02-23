@@ -51,6 +51,39 @@ class LimitOrderExecutionEngine:
     def reset_kill_switch(self) -> None:
         self._kill_switch = KillSwitchState()
 
+    def set_price_epsilon(self, epsilon: float) -> None:
+        if epsilon <= 0.0:
+            return
+        self._config.price_epsilon = epsilon
+
+    def drop_intent(self, order_id: str) -> bool:
+        """Drops an active intent without counting it as a fill."""
+        normalized = order_id.strip()
+        if not normalized:
+            return False
+
+        for key, active in list(self._active_intents.items()):
+            if active.order_id != normalized:
+                continue
+            self._active_intents.pop(key, None)
+            return True
+        return False
+
+    def cancel_all_intents(self, *, reason: str) -> list[ExecutionAction]:
+        actions: list[ExecutionAction] = []
+        for key, active in list(self._active_intents.items()):
+            actions.extend(self._cancel_intent(key=key, active=active, reason=reason))
+        return actions
+
+    def latch_kill_switch(
+        self,
+        *,
+        reason: KillSwitchReason,
+        now: datetime | None = None,
+    ) -> ExecutionResult:
+        actions = self._activate_kill_switch((reason,), now=now or self._now_fn())
+        return ExecutionResult(actions=actions, kill_switch=self._kill_switch)
+
     def mark_order_filled(self, order_id: str) -> bool:
         """Marks an order as filled and clears its active intent."""
         normalized = order_id.strip()

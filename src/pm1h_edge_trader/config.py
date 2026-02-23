@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 from typing import Mapping
 
 
-class RuntimeMode(StrEnum):
+try:  # Python 3.11+
+    from enum import StrEnum as _BaseStrEnum
+except ImportError:  # pragma: no cover - Python <3.11 compatibility
+    class _BaseStrEnum(str, Enum):
+        pass
+
+
+class RuntimeMode(_BaseStrEnum):
     """Trading runtime mode."""
 
     DRY_RUN = "dry-run"
@@ -46,10 +53,23 @@ class BinanceConfig:
 
 @dataclass(slots=True, frozen=True)
 class VolatilityConfig:
+    rv_interval: str = "1h"
     rv_lookback_hours: int = 48
+    rv_ewma_half_life: float = 0.0
+    rv_short_interval: str = "5m"
+    rv_short_lookback_hours: int = 12
+    rv_short_ewma_half_life: float = 18.0
+    rv_tau_switch_seconds: float = 1800.0
     rv_refresh_seconds: float = 60.0
     rv_fallback: float = 0.55
     rv_floor: float = 0.10
+    enable_deribit_iv: bool = False
+    deribit_iv_currency: str = "BTC"
+    deribit_iv_resolution_minutes: int = 60
+    deribit_iv_lookback_hours: int = 48
+    deribit_iv_refresh_seconds: float = 60.0
+    deribit_iv_floor: float = 0.05
+    deribit_iv_cap: float = 3.00
     sigma_weight: float = 1.0
     iv_override: float | None = None
 
@@ -90,6 +110,8 @@ class SafetyConfig:
     require_book_match: bool = True
     fee_must_be_zero: bool = True
     entry_block_window_seconds: float = 60.0
+    heartbeat_interval_seconds: float = 5.0
+    open_order_reconcile_interval_seconds: float = 10.0
     requote_interval_seconds: float = 15.0
     max_intent_age_seconds: float = 45.0
     kill_switch_latch: bool = True
@@ -151,6 +173,16 @@ def build_config(
     max_market_notional: float | None = None,
     max_daily_loss: float | None = None,
     max_entries_per_market: int = 1,
+    rv_interval: str | None = None,
+    rv_ewma_half_life: float | None = None,
+    rv_short_interval: str | None = None,
+    rv_short_lookback_hours: int | None = None,
+    rv_short_ewma_half_life: float | None = None,
+    rv_tau_switch_seconds: float | None = None,
+    enable_deribit_iv: bool = False,
+    deribit_iv_resolution_minutes: int | None = None,
+    deribit_iv_lookback_hours: int | None = None,
+    deribit_iv_refresh_seconds: float | None = None,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
 ) -> AppConfig:
@@ -169,9 +201,19 @@ def build_config(
         polymarket_live_auth=polymarket_live_auth or PolymarketLiveAuthConfig(),
         binance=BinanceConfig(symbol=binance_symbol.upper()),
         volatility=VolatilityConfig(
+            rv_interval=(rv_interval or "1h").strip() or "1h",
             rv_fallback=rv_fallback,
+            rv_ewma_half_life=max(0.0, rv_ewma_half_life or 0.0),
+            rv_short_interval=(rv_short_interval or "5m").strip() or "5m",
+            rv_short_lookback_hours=max(1, rv_short_lookback_hours or 12),
+            rv_short_ewma_half_life=max(0.0, rv_short_ewma_half_life or 18.0),
+            rv_tau_switch_seconds=max(1.0, rv_tau_switch_seconds or 1800.0),
             sigma_weight=sigma_weight,
             iv_override=iv_override,
+            enable_deribit_iv=enable_deribit_iv,
+            deribit_iv_resolution_minutes=max(1, deribit_iv_resolution_minutes or 60),
+            deribit_iv_lookback_hours=max(1, deribit_iv_lookback_hours or 48),
+            deribit_iv_refresh_seconds=max(5.0, deribit_iv_refresh_seconds or 60.0),
         ),
         decision=DecisionConfig(
             edge_min=edge_min,

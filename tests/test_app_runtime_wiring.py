@@ -21,9 +21,13 @@ from pm1h_edge_trader.engine import DecisionOutcome, TradeIntent  # noqa: E402
 from pm1h_edge_trader.execution import DryRunExecutionAdapter  # noqa: E402
 from pm1h_edge_trader.execution import (  # noqa: E402
     ActiveIntent,
+    CancelResult,
     ExecutionAction,
     ExecutionActionType,
+    ExecutionConfig,
     IntentSignal,
+    LimitOrderExecutionEngine,
+    OrderHandle,
     OrderRequest,
     OrderStatus,
     Side,
@@ -33,6 +37,46 @@ from pm1h_edge_trader.execution.polymarket_live_adapter import (  # noqa: E402
 )
 from pm1h_edge_trader.feeds.models import BestQuote, UnderlyingSnapshot  # noqa: E402
 from pm1h_edge_trader.main import PM1HEdgeTraderApp  # noqa: E402
+
+
+class _FakeLiveOpsAdapter:
+    def __init__(self, *, now: datetime) -> None:
+        self._now = now
+        self._counter = 0
+        self.open_order_ids: set[str] = set()
+        self.canceled_order_ids: list[str] = []
+        self.cancel_all_calls = 0
+        self.heartbeat_calls = 0
+        self.heartbeat_ok = True
+        self.tick_sizes: dict[str, float] = {}
+
+    def place_limit_order(self, request: OrderRequest) -> OrderHandle:
+        self._counter += 1
+        order_id = f"live-{self._counter}"
+        self.open_order_ids.add(order_id)
+        return OrderHandle(order_id=order_id, status=OrderStatus.OPEN, acknowledged_at=self._now)
+
+    def cancel_order(self, order_id: str) -> CancelResult:
+        self.canceled_order_ids.append(order_id)
+        canceled = order_id in self.open_order_ids
+        self.open_order_ids.discard(order_id)
+        return CancelResult(order_id=order_id, canceled=canceled, acknowledged_at=self._now)
+
+    def list_open_order_ids(self) -> set[str]:
+        return set(self.open_order_ids)
+
+    def cancel_all_orders(self) -> int:
+        self.cancel_all_calls += 1
+        count = len(self.open_order_ids)
+        self.open_order_ids.clear()
+        return count
+
+    def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
+        self.heartbeat_calls += 1
+        return self.heartbeat_ok
+
+    def get_tick_size(self, token_id: str) -> float | None:
+        return self.tick_sizes.get(token_id)
 
 
 class AppRuntimeWiringTests(unittest.TestCase):
@@ -293,6 +337,106 @@ class AppRuntimeWiringTests(unittest.TestCase):
 
         # bankroll=100, default market cap is 25% => 25.0, with 15.0 already used -> remaining 10.0
         self.assertAlmostEqual(signal.size, 10.0 / 0.55, places=8)
+
+    def test_set_market_tick_sizes_updates_price_epsilon(self) -> None:
+        config = self._build_config(mode=RuntimeMode.DRY_RUN)
+        app = PM1HEdgeTraderApp(config)
+
+        app._set_market_tick_sizes({"tok-up": 0.01, "tok-down": 0.001})
+
+        self.assertEqual(app._token_tick_sizes["tok-up"], 0.01)
+        self.assertEqual(app._execution_engine._config.price_epsilon, 0.0005)
+
+    def test_reconcile_live_open_orders_cancels_orphans_and_drops_missing_intents(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+
+        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id="live-100",
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.50,
+            size=10.0,
+            edge=0.03,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+        adapter.open_order_ids = {"ghost-1"}
+
+        app._reconcile_live_open_orders(now=now, force=True)
+
+        self.assertIn("ghost-1", adapter.canceled_order_ids)
+        self.assertEqual(engine.active_intents(), {})
+
+    def test_heartbeat_failure_latches_emergency_and_cancels_all_live_orders(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        adapter.heartbeat_ok = False
+        adapter.open_order_ids = {"ghost-1"}
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+
+        app._run_live_heartbeat(now=now, force=True)
+
+        self.assertEqual(adapter.heartbeat_calls, 1)
+        self.assertEqual(adapter.cancel_all_calls, 1)
+        self.assertTrue(app._external_kill_switch_latched)
+        self.assertTrue(engine.kill_switch.active)
+
+    def test_near_expiry_cleanup_cancels_existing_intents_once(self) -> None:
+        config = self._build_config(mode=RuntimeMode.DRY_RUN)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+        adapter = app._execution_engine._adapter
+        assert isinstance(adapter, DryRunExecutionAdapter)
+
+        handle = adapter.place_limit_order(
+            OrderRequest(
+                market_id="mkt-1",
+                token_id="tok-up",
+                side=Side.BUY,
+                price=0.55,
+                size=10.0,
+                submitted_at=now,
+            )
+        )
+        app._execution_engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id=handle.order_id,
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.55,
+            size=10.0,
+            edge=0.02,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+
+        cleaned = app._enforce_near_expiry_cleanup(
+            market_id="mkt-1",
+            seconds_to_expiry=30.0,
+            now=now,
+        )
+
+        self.assertTrue(cleaned)
+        self.assertEqual(app._execution_engine.active_intents(), {})
 
 
 if __name__ == "__main__":

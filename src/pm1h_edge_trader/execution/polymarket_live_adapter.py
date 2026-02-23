@@ -92,6 +92,45 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
             acknowledged_at=self._now_fn(),
         )
 
+    def list_open_order_ids(self) -> set[str]:
+        self._ensure_authenticated_api_creds()
+        try:
+            response = self._client.get_orders()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Polymarket list_open_order_ids failed ({exc.__class__.__name__})."
+            ) from exc
+        return _collect_order_ids(response)
+
+    def cancel_all_orders(self) -> int:
+        self._ensure_authenticated_api_creds()
+        try:
+            response = self._client.cancel_all()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Polymarket cancel_all_orders failed ({exc.__class__.__name__})."
+            ) from exc
+        return _count_canceled_orders(response)
+
+    def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
+        self._ensure_authenticated_api_creds()
+        try:
+            self._client.post_heartbeat(heartbeat_id)
+            return True
+        except Exception:
+            return False
+
+    def get_tick_size(self, token_id: str) -> float | None:
+        normalized = token_id.strip()
+        if not normalized:
+            return None
+        try:
+            value = self._client.get_tick_size(normalized)
+        except Exception:
+            return None
+        parsed = _safe_positive_float(value)
+        return parsed
+
     def _set_static_api_creds(self, auth: PolymarketLiveAuthConfig) -> None:
         if _has_text(auth.api_key) and _has_text(auth.api_secret) and _has_text(auth.api_passphrase):
             if ApiCreds is None:
@@ -183,3 +222,56 @@ def _contains_order_id(payload: object, order_id: str) -> bool:
 
 def _has_text(value: str | None) -> bool:
     return value is not None and bool(value.strip())
+
+
+def _collect_order_ids(payload: object) -> set[str]:
+    found: set[str] = set()
+    if isinstance(payload, Mapping):
+        for key in ("id", "orderID", "orderId", "order_id"):
+            candidate = payload.get(key)
+            if isinstance(candidate, str):
+                normalized = candidate.strip()
+                if normalized:
+                    found.add(normalized)
+        for value in payload.values():
+            found.update(_collect_order_ids(value))
+        return found
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            found.update(_collect_order_ids(item))
+        return found
+    return found
+
+
+def _count_canceled_orders(payload: object) -> int:
+    if isinstance(payload, Mapping):
+        for key in (
+            "canceled",
+            "cancelled",
+            "canceledOrderIDs",
+            "cancelledOrderIDs",
+            "orderIDs",
+            "order_ids",
+        ):
+            value = payload.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+                return len([item for item in value if isinstance(item, str) and item.strip()])
+        if isinstance(payload.get("success"), bool):
+            return 1 if payload.get("success") is True else 0
+    return len(_collect_order_ids(payload))
+
+
+def _safe_positive_float(value: object) -> float | None:
+    if isinstance(value, (float, int)):
+        parsed = float(value)
+        return parsed if parsed > 0.0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    return parsed if parsed > 0.0 else None

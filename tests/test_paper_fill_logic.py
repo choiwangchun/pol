@@ -9,10 +9,18 @@ SRC_DIR = ROOT_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from pm1h_edge_trader.main import _should_mark_dry_run_fill  # noqa: E402
+from pm1h_edge_trader.main import _limit_price, _should_mark_dry_run_fill  # noqa: E402
 
 
 class PaperFillLogicTests(unittest.TestCase):
+    def test_limit_price_respects_tick_size_flooring(self) -> None:
+        price = _limit_price(ask=0.90, fair_probability=0.537, edge_buffer=0.0, tick_size=0.01)
+        self.assertEqual(price, 0.53)
+
+    def test_limit_price_default_tick_size_keeps_four_decimal_precision(self) -> None:
+        price = _limit_price(ask=0.90, fair_probability=0.53789, edge_buffer=0.0)
+        self.assertEqual(price, 0.5378)
+
     def test_marks_fill_when_limit_price_crosses_or_matches_best_ask(self) -> None:
         self.assertTrue(_should_mark_dry_run_fill(limit_price=0.55, best_ask=0.55))
         self.assertTrue(_should_mark_dry_run_fill(limit_price=0.56, best_ask=0.55))

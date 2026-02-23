@@ -24,11 +24,23 @@ class _FakeClient:
         self.create_order_calls: list[object] = []
         self.post_order_calls: list[object] = []
         self.cancel_calls: list[str] = []
+        self.get_orders_calls = 0
+        self.cancel_all_calls = 0
+        self.post_heartbeat_calls: list[str | None] = []
+        self.get_tick_size_calls: list[str] = []
         self.post_order_response: object = {"id": "oid-1"}
         self.cancel_response: object = {"canceled": ["oid-1"]}
+        self.get_orders_response: object = {"data": [{"id": "oid-1"}]}
+        self.cancel_all_response: object = {"canceledOrderIDs": ["oid-1", "oid-2"]}
+        self.heartbeat_response: object = {"ok": True}
+        self.tick_size_response: object = "0.01"
         self.raise_from_create: Exception | None = None
         self.raise_from_post: Exception | None = None
         self.raise_from_cancel: Exception | None = None
+        self.raise_from_get_orders: Exception | None = None
+        self.raise_from_cancel_all: Exception | None = None
+        self.raise_from_heartbeat: Exception | None = None
+        self.raise_from_get_tick_size: Exception | None = None
 
     def create_or_derive_api_creds(self) -> object:
         self.create_or_derive_api_creds_calls += 1
@@ -54,6 +66,30 @@ class _FakeClient:
             raise self.raise_from_cancel
         self.cancel_calls.append(order_id)
         return self.cancel_response
+
+    def get_orders(self, params=None, next_cursor="MA=="):  # type: ignore[no-untyped-def]
+        if self.raise_from_get_orders is not None:
+            raise self.raise_from_get_orders
+        self.get_orders_calls += 1
+        return self.get_orders_response
+
+    def cancel_all(self) -> object:
+        if self.raise_from_cancel_all is not None:
+            raise self.raise_from_cancel_all
+        self.cancel_all_calls += 1
+        return self.cancel_all_response
+
+    def post_heartbeat(self, heartbeat_id: str | None) -> object:
+        if self.raise_from_heartbeat is not None:
+            raise self.raise_from_heartbeat
+        self.post_heartbeat_calls.append(heartbeat_id)
+        return self.heartbeat_response
+
+    def get_tick_size(self, token_id: str) -> object:
+        if self.raise_from_get_tick_size is not None:
+            raise self.raise_from_get_tick_size
+        self.get_tick_size_calls.append(token_id)
+        return self.tick_size_response
 
 
 class PolymarketLiveAdapterTests(unittest.TestCase):
@@ -152,6 +188,49 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         message = str(context.exception)
         self.assertIn("place_limit_order failed", message)
         self.assertNotIn("private-key-secret", message)
+
+    def test_list_open_order_ids_parses_payload(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.get_orders_response = {
+            "data": [{"id": "oid-1"}, {"orderID": "oid-2"}],
+            "meta": {"cursor": "next"},
+        }
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        order_ids = adapter.list_open_order_ids()
+
+        self.assertEqual(order_ids, {"oid-1", "oid-2"})
+        self.assertEqual(fake_client.get_orders_calls, 1)
+
+    def test_cancel_all_orders_returns_canceled_count(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.cancel_all_response = {"canceledOrderIDs": ["oid-1", "oid-2", "oid-3"]}
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        canceled_count = adapter.cancel_all_orders()
+
+        self.assertEqual(canceled_count, 3)
+        self.assertEqual(fake_client.cancel_all_calls, 1)
+
+    def test_send_heartbeat_returns_false_on_exception(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.raise_from_heartbeat = RuntimeError("offline")
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        ok = adapter.send_heartbeat(heartbeat_id="hb-1")
+
+        self.assertFalse(ok)
+        self.assertEqual(fake_client.post_heartbeat_calls, [])
+
+    def test_get_tick_size_parses_float(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.tick_size_response = "0.001"
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        tick_size = adapter.get_tick_size("token-up")
+
+        self.assertEqual(tick_size, 0.001)
+        self.assertEqual(fake_client.get_tick_size_calls, ["token-up"])
 
 
 if __name__ == "__main__":
