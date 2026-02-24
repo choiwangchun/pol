@@ -27,13 +27,22 @@ class _FakeClient:
         self.get_orders_calls = 0
         self.cancel_all_calls = 0
         self.post_heartbeat_calls: list[str | None] = []
+        self.raise_from_heartbeat_sequence: list[Exception] = []
+        self.heartbeat_responses: list[object] = []
         self.get_tick_size_calls: list[str] = []
+        self.get_balance_allowance_calls = 0
+        self.update_balance_allowance_calls = 0
+        self.get_order_calls: list[str] = []
+        self.get_trades_calls: list[object] = []
         self.post_order_response: object = {"id": "oid-1"}
         self.cancel_response: object = {"canceled": ["oid-1"]}
         self.get_orders_response: object = {"data": [{"id": "oid-1"}]}
         self.cancel_all_response: object = {"canceledOrderIDs": ["oid-1", "oid-2"]}
         self.heartbeat_response: object = {"ok": True}
         self.tick_size_response: object = "0.01"
+        self.balance_allowance_response: object = {"balance": "123.45", "allowance": "120.0"}
+        self.get_order_response: object = {"order": {"id": "oid-1", "status": "LIVE"}}
+        self.get_trades_response: object = [{"id": "trade-1", "price": "0.51"}]
         self.raise_from_create: Exception | None = None
         self.raise_from_post: Exception | None = None
         self.raise_from_cancel: Exception | None = None
@@ -80,9 +89,13 @@ class _FakeClient:
         return self.cancel_all_response
 
     def post_heartbeat(self, heartbeat_id: str | None) -> object:
+        self.post_heartbeat_calls.append(heartbeat_id)
+        if self.raise_from_heartbeat_sequence:
+            raise self.raise_from_heartbeat_sequence.pop(0)
         if self.raise_from_heartbeat is not None:
             raise self.raise_from_heartbeat
-        self.post_heartbeat_calls.append(heartbeat_id)
+        if self.heartbeat_responses:
+            return self.heartbeat_responses.pop(0)
         return self.heartbeat_response
 
     def get_tick_size(self, token_id: str) -> object:
@@ -90,6 +103,29 @@ class _FakeClient:
             raise self.raise_from_get_tick_size
         self.get_tick_size_calls.append(token_id)
         return self.tick_size_response
+
+    def update_balance_allowance(self, params=None) -> object:  # type: ignore[no-untyped-def]
+        self.update_balance_allowance_calls += 1
+        return {"ok": True}
+
+    def get_balance_allowance(self, params=None) -> object:  # type: ignore[no-untyped-def]
+        self.get_balance_allowance_calls += 1
+        return self.balance_allowance_response
+
+    def get_order(self, order_id: str) -> object:
+        self.get_order_calls.append(order_id)
+        return self.get_order_response
+
+    def get_trades(self, params=None, next_cursor="MA=="):  # type: ignore[no-untyped-def]
+        self.get_trades_calls.append(params)
+        return self.get_trades_response
+
+
+class _PolyLikeApiError(Exception):
+    def __init__(self, *, status_code: int, error_msg) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(f"status={status_code}")
+        self.status_code = status_code
+        self.error_msg = error_msg
 
 
 class PolymarketLiveAdapterTests(unittest.TestCase):
@@ -144,7 +180,7 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         self.assertEqual(order_args.token_id, "token-down")
         self.assertEqual(order_args.price, 0.47)
         self.assertEqual(order_args.size, 21.0)
-        self.assertEqual(order_args.side, 0)
+        self.assertEqual(order_args.side, "BUY")
         self.assertEqual(handle.order_id, "oid-1")
 
     def test_place_limit_order_reads_order_id_variants(self) -> None:
@@ -220,7 +256,38 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         ok = adapter.send_heartbeat(heartbeat_id="hb-1")
 
         self.assertFalse(ok)
-        self.assertEqual(fake_client.post_heartbeat_calls, [])
+        self.assertEqual(fake_client.post_heartbeat_calls, ["hb-1"])
+
+    def test_send_heartbeat_tracks_and_reuses_latest_heartbeat_id(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.heartbeat_responses = [
+            {"heartbeat_id": "hb-1"},
+            {"heartbeat_id": "hb-2"},
+        ]
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        first = adapter.send_heartbeat()
+        second = adapter.send_heartbeat()
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(fake_client.post_heartbeat_calls, [None, "hb-1"])
+
+    def test_send_heartbeat_recovers_from_invalid_heartbeat_id_with_retry(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.raise_from_heartbeat_sequence = [
+            _PolyLikeApiError(
+                status_code=400,
+                error_msg={"error": "Invalid Heartbeat ID", "heartbeat_id": "hb-recovered"},
+            )
+        ]
+        fake_client.heartbeat_response = {"heartbeat_id": "hb-next"}
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        ok = adapter.send_heartbeat()
+
+        self.assertTrue(ok)
+        self.assertEqual(fake_client.post_heartbeat_calls, [None, "hb-recovered"])
 
     def test_get_tick_size_parses_float(self) -> None:
         fake_client = _FakeClient()
@@ -231,6 +298,71 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
 
         self.assertEqual(tick_size, 0.001)
         self.assertEqual(fake_client.get_tick_size_calls, ["token-up"])
+
+    def test_get_collateral_balance_allowance_reads_balance_and_allowance(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.balance_allowance_response = {"balance": "7731927", "allowance": "2000000"}
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        balance, allowance = adapter.get_collateral_balance_allowance(refresh=True)
+
+        self.assertEqual(balance, 7.731927)
+        self.assertEqual(allowance, 2.0)
+        self.assertEqual(fake_client.update_balance_allowance_calls, 1)
+        self.assertEqual(fake_client.get_balance_allowance_calls, 1)
+
+    def test_get_collateral_balance_allowance_handles_nested_payload(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.balance_allowance_response = {
+            "data": {"balance": "99500000"},
+            "meta": {"allowance": "88000000"},
+        }
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        balance, allowance = adapter.get_collateral_balance_allowance(refresh=False)
+
+        self.assertEqual(balance, 99.5)
+        self.assertEqual(allowance, 88.0)
+
+    def test_get_collateral_balance_allowance_uses_allowances_map_when_allowance_missing(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.balance_allowance_response = {
+            "balance": "10000000",
+            "allowances": {"0xA": "1000000", "0xB": "2500000"},
+        }
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        balance, allowance = adapter.get_collateral_balance_allowance(refresh=False)
+
+        self.assertEqual(balance, 10.0)
+        self.assertEqual(allowance, 2.5)
+
+    def test_get_order_fetches_payload(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.get_order_response = {"order": {"id": "oid-17", "status": "MATCHED"}}
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        payload = adapter.get_order("oid-17")
+
+        self.assertEqual(fake_client.get_order_calls, ["oid-17"])
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["order"]["status"], "MATCHED")
+
+    def test_get_trade_fetches_order_trade_by_id(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.get_trades_response = [
+            {"id": "trade-1", "price": "0.49"},
+            {"id": "trade-2", "price": "0.51"},
+        ]
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        payload = adapter.get_trade("trade-2")
+
+        self.assertEqual(len(fake_client.get_trades_calls), 1)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["id"], "trade-2")
 
 
 if __name__ == "__main__":

@@ -10,13 +10,18 @@ from .types import CancelResult, OrderHandle, OrderRequest, OrderStatus, utc_now
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs
+    from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, OrderArgs, TradeParams
+    from py_clob_client.order_builder.constants import BUY as CLOB_BUY
 except Exception:  # pragma: no cover - optional runtime dependency during import
     ClobClient = None  # type: ignore[assignment]
     ApiCreds = None  # type: ignore[assignment]
+    BalanceAllowanceParams = None  # type: ignore[assignment]
     OrderArgs = None  # type: ignore[assignment]
+    TradeParams = None  # type: ignore[assignment]
+    CLOB_BUY = "BUY"  # type: ignore[assignment]
 
-CLOB_SIDE_BUY = 0
+COLLATERAL_DECIMALS = 6
+COLLATERAL_SCALE = float(10**COLLATERAL_DECIMALS)
 
 
 class PolymarketLiveExecutionAdapter(ExecutionAdapter):
@@ -45,6 +50,7 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
                 funder=auth.funder,
             )
             self._api_creds_ready = False
+            self._heartbeat_id: str | None = None
             self._set_static_api_creds(auth)
         except Exception as exc:
             raise RuntimeError(
@@ -58,7 +64,7 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
                 token_id=request.token_id,
                 price=float(request.price),
                 size=float(request.size),
-                side=CLOB_SIDE_BUY,
+                side=CLOB_BUY,
             )
             signed_order = self._client.create_order(order_args)
             response = self._client.post_order(signed_order)
@@ -114,11 +120,23 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
 
     def send_heartbeat(self, *, heartbeat_id: str | None = None) -> bool:
         self._ensure_authenticated_api_creds()
+        requested_id = heartbeat_id.strip() if isinstance(heartbeat_id, str) else None
+        current_id = requested_id or self._heartbeat_id
         try:
-            self._client.post_heartbeat(heartbeat_id)
-            return True
-        except Exception:
-            return False
+            response = self._client.post_heartbeat(current_id)
+        except Exception as exc:
+            recovered = _extract_heartbeat_id_from_exception_error(exc)
+            if recovered is None:
+                return False
+            self._heartbeat_id = recovered
+            try:
+                response = self._client.post_heartbeat(self._heartbeat_id)
+            except Exception:
+                return False
+        next_id = _extract_heartbeat_id_from_payload(response)
+        if next_id is not None:
+            self._heartbeat_id = next_id
+        return True
 
     def get_tick_size(self, token_id: str) -> float | None:
         normalized = token_id.strip()
@@ -130,6 +148,53 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
             return None
         parsed = _safe_positive_float(value)
         return parsed
+
+    def get_collateral_balance_allowance(self, *, refresh: bool = True) -> tuple[float | None, float | None]:
+        self._ensure_authenticated_api_creds()
+        params = _build_balance_allowance_params()
+        try:
+            if refresh:
+                self._client.update_balance_allowance(params)
+        except Exception:
+            # Best-effort refresh; continue with read.
+            pass
+        try:
+            payload = self._client.get_balance_allowance(params)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Polymarket get_collateral_balance_allowance failed ({exc.__class__.__name__})."
+            ) from exc
+        balance = _extract_collateral_by_keys(payload, ("balance", "available", "available_balance"))
+        allowance = _extract_collateral_by_keys(payload, ("allowance",))
+        if allowance is None:
+            allowance = _extract_max_collateral_allowance(payload)
+        return balance, allowance
+
+    def get_order(self, order_id: str) -> Mapping[str, Any] | None:
+        self._ensure_authenticated_api_creds()
+        normalized = order_id.strip()
+        if not normalized:
+            return None
+        try:
+            payload = self._client.get_order(normalized)
+        except Exception:
+            return None
+        return payload if isinstance(payload, Mapping) else None
+
+    def get_trade(self, trade_id: str) -> Mapping[str, Any] | None:
+        self._ensure_authenticated_api_creds()
+        normalized = trade_id.strip()
+        if not normalized or TradeParams is None:
+            return None
+        try:
+            params = TradeParams(id=normalized)  # type: ignore[misc,operator]
+            payload = self._client.get_trades(params=params)
+        except Exception:
+            return None
+        trade = _find_trade_by_id(payload, normalized)
+        if trade is not None:
+            return trade
+        return payload if isinstance(payload, Mapping) else None
 
     def _set_static_api_creds(self, auth: PolymarketLiveAuthConfig) -> None:
         if _has_text(auth.api_key) and _has_text(auth.api_secret) and _has_text(auth.api_passphrase):
@@ -164,6 +229,57 @@ def _extract_order_id(payload: object) -> str | None:
         return None
     normalized = order_id.strip()
     return normalized or None
+
+
+def _extract_heartbeat_id_from_payload(payload: object) -> str | None:
+    if isinstance(payload, Mapping):
+        candidate = payload.get("heartbeat_id")
+        if isinstance(candidate, str):
+            normalized = candidate.strip()
+            if normalized:
+                return normalized
+        for nested_key in ("data", "result"):
+            nested = payload.get(nested_key)
+            nested_id = _extract_heartbeat_id_from_payload(nested)
+            if nested_id is not None:
+                return nested_id
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            nested_id = _extract_heartbeat_id_from_payload(item)
+            if nested_id is not None:
+                return nested_id
+    return None
+
+
+def _extract_heartbeat_id_from_exception_error(exc: Exception) -> str | None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code != 400:
+        return None
+    error_msg = getattr(exc, "error_msg", None)
+    if error_msg is None:
+        return None
+    return _extract_heartbeat_id_from_payload(error_msg)
+
+
+def _find_trade_by_id(payload: object, trade_id: str) -> Mapping[str, Any] | None:
+    normalized_id = trade_id.strip()
+    if not normalized_id:
+        return None
+    if isinstance(payload, Mapping):
+        candidate = _extract_first_str_by_keys(payload, ("id", "trade_id", "tradeID"))
+        if candidate is not None and candidate.strip() == normalized_id:
+            return payload
+        for key in ("data", "result", "trade"):
+            nested = payload.get(key)
+            found = _find_trade_by_id(nested, normalized_id)
+            if found is not None:
+                return found
+    elif isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            found = _find_trade_by_id(item, normalized_id)
+            if found is not None:
+                return found
+    return None
 
 
 def _extract_first_str_by_keys(payload: object, keys: Sequence[str]) -> str | None:
@@ -275,3 +391,94 @@ def _safe_positive_float(value: object) -> float | None:
     except ValueError:
         return None
     return parsed if parsed > 0.0 else None
+
+
+def _build_balance_allowance_params() -> object:
+    if BalanceAllowanceParams is None:
+        raise RuntimeError("py-clob-client BalanceAllowanceParams type is unavailable")
+    params = BalanceAllowanceParams()  # type: ignore[misc,operator]
+    setattr(params, "asset_type", "COLLATERAL")
+    setattr(params, "signature_type", -1)
+    return params
+
+
+def _extract_collateral_by_keys(payload: object, keys: Sequence[str]) -> float | None:
+    if isinstance(payload, Mapping):
+        for key in keys:
+            value = payload.get(key)
+            parsed = _parse_collateral_amount(value)
+            if parsed is not None:
+                return parsed
+        for value in payload.values():
+            nested = _extract_collateral_by_keys(value, keys)
+            if nested is not None:
+                return nested
+        return None
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            nested = _extract_collateral_by_keys(item, keys)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _extract_max_collateral_allowance(payload: object) -> float | None:
+    if isinstance(payload, Mapping):
+        allowances = payload.get("allowances")
+        if isinstance(allowances, Mapping):
+            best: float | None = None
+            for value in allowances.values():
+                parsed = _parse_collateral_amount(value)
+                if parsed is None:
+                    continue
+                if best is None or parsed > best:
+                    best = parsed
+            if best is not None:
+                return best
+        for value in payload.values():
+            nested = _extract_max_collateral_allowance(value)
+            if nested is not None:
+                return nested
+        return None
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
+        for item in payload:
+            nested = _extract_max_collateral_allowance(item)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _parse_collateral_amount(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if value <= 0:
+            return None
+        return float(value) / COLLATERAL_SCALE
+    if isinstance(value, float):
+        if value <= 0.0:
+            return None
+        return value
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+    if any(marker in text for marker in (".", "e", "E")):
+        try:
+            parsed_float = float(text)
+        except ValueError:
+            return None
+        return parsed_float if parsed_float > 0.0 else None
+    try:
+        parsed_int = int(text)
+    except ValueError:
+        try:
+            parsed_float = float(text)
+        except ValueError:
+            return None
+        return parsed_float if parsed_float > 0.0 else None
+    if parsed_int <= 0:
+        return None
+    return float(parsed_int) / COLLATERAL_SCALE

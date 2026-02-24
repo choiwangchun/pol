@@ -20,5 +20,9 @@ __pycache__/
 .venv/
 .venv.broken-*/
 
+# Electron
+desktop/node_modules/
+desktop/dist/
+
 # OS/editor artifacts
 .DS_Store

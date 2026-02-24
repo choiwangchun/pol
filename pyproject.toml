@@ -14,6 +14,9 @@ dependencies = [
 
 [project.scripts]
 pm1h-edge-trader = "pm1h_edge_trader.main:main"
+pm1h-manual-entry = "pm1h_edge_trader.manual_entry:main"
+pm1h-live-balance = "pm1h_edge_trader.live_balance:main"
+pm1h-derive-api-creds = "pm1h_edge_trader.api_credentials:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

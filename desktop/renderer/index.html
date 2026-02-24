@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PM 1H Trader Desk</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>PM 1H Trader Desk</h1>
+          <p>실행 제어, 포지션 진입, 상태 모니터링을 한 화면에서 관리합니다.</p>
+        </div>
+        <div id="runtimeBadge" class="badge stopped">Stopped</div>
+      </header>
+
+      <section class="controls-grid">
+        <article class="panel">
+          <h2>매매 시작</h2>
+          <div class="form-row">
+            <label for="mode">모드</label>
+            <select id="mode">
+              <option value="dry-run">Dry Run</option>
+              <option value="live">Live</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="bankroll">Bankroll (USD)</label>
+            <input id="bankroll" type="number" min="1" step="1" value="1000" />
+          </div>
+          <p id="liveBalanceHint" class="muted"></p>
+          <div class="form-row">
+            <label for="tickSeconds">Tick Seconds</label>
+            <input id="tickSeconds" type="number" min="0.2" step="0.2" value="1" />
+          </div>
+          <div class="form-row">
+            <label for="maxTicks">Max Ticks (0=무제한)</label>
+            <input id="maxTicks" type="number" min="0" step="1" value="0" />
+          </div>
+          <div class="form-row inline">
+            <label for="fCap">F Cap</label>
+            <input id="fCap" type="number" min="0.01" max="1" step="0.01" value="0.25" />
+            <label for="minOrderNotional">Min Notional</label>
+            <input id="minOrderNotional" type="number" min="0.1" step="0.1" value="0.3" />
+          </div>
+          <p class="muted">소액 계정 테스트용 권장값: f_cap 0.25, min_notional 0.3</p>
+          <div class="checkbox-row">
+            <label><input id="freshStart" type="checkbox" checked /> Fresh Start</label>
+            <label><input id="disableWebsocket" type="checkbox" /> REST Only</label>
+          </div>
+          <div class="checkbox-row">
+            <label><input id="enablePolicyBandit" type="checkbox" /> Policy Bandit</label>
+            <label><input id="policyShadowMode" type="checkbox" checked /> Shadow Mode</label>
+          </div>
+          <div class="form-row inline">
+            <label for="policyExplorationEpsilon">Epsilon</label>
+            <input id="policyExplorationEpsilon" type="number" min="0" max="1" step="0.01" value="0.05" />
+            <label for="policyUcbC">UCB C</label>
+            <input id="policyUcbC" type="number" min="0" step="0.1" value="1.0" />
+          </div>
+          <div class="actions">
+            <button id="startButton" class="btn primary">매매 시작</button>
+            <button id="stopButton" class="btn danger">중지</button>
+          </div>
+          <p id="commandPreview" class="muted"></p>
+        </article>
+
+        <article class="panel">
+          <h2>포지션 진입</h2>
+          <p class="muted">한 번만 즉시 진입하는 수동 명령입니다. Live 모드에서는 실주문이 나갑니다.</p>
+          <div class="form-row">
+            <label for="entryMode">진입 모드</label>
+            <select id="entryMode">
+              <option value="dry-run">Dry Run</option>
+              <option value="live">Live</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="entryDirection">방향</label>
+            <select id="entryDirection">
+              <option value="up">UP Token 매수</option>
+              <option value="down">DOWN Token 매수</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label for="entryUsd">진입 금액 (USD)</label>
+            <input id="entryUsd" type="number" min="1" step="1" value="50" />
+          </div>
+          <div class="form-row">
+            <label for="entryPrice">지정가 (선택)</label>
+            <input id="entryPrice" type="number" min="0.001" max="0.999" step="0.001" placeholder="비우면 best ask" />
+          </div>
+          <div class="checkbox-row">
+            <label><input id="entryDisableWebsocket" type="checkbox" /> REST Only</label>
+          </div>
+          <div class="actions">
+            <button id="entryButton" class="btn accent">포지션 진입</button>
+          </div>
+          <pre id="entryResult" class="result-box">아직 요청 없음</pre>
+        </article>
+      </section>
+
+      <section class="cards">
+        <article class="card">
+          <h3>Current Balance</h3>
+          <p id="currentBalance">$0.00</p>
+        </article>
+        <article class="card">
+          <h3>Realized PnL</h3>
+          <p id="realizedPnl">$0.00</p>
+        </article>
+        <article class="card">
+          <h3>Win Rate</h3>
+          <p id="winRate">0.00%</p>
+        </article>
+        <article class="card">
+          <h3>Unsettled Notional</h3>
+          <p id="unsettledNotional">$0.00</p>
+        </article>
+      </section>
+
+      <section class="workspace-grid">
+        <article class="panel large">
+          <div class="panel-head">
+            <h2>열린 포지션</h2>
+            <span id="openCount" class="pill">0</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Market</th>
+                  <th>Order</th>
+                  <th>Side</th>
+                  <th>Price</th>
+                  <th>Size</th>
+                  <th>Notional</th>
+                </tr>
+              </thead>
+              <tbody id="openPositionsBody"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel large">
+          <div class="panel-head">
+            <h2>실시간 로그</h2>
+            <button id="clearLogButton" class="btn subtle">Clear</button>
+          </div>
+          <pre id="logPane" class="log-pane"></pre>
+        </article>
+      </section>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -49,6 +49,8 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
   --max-ticks 1
 ```
 
+`--mode live`에서는 CLOB `balance/allowance`를 조회해 bankroll이 자동으로 계좌 기준으로 설정됩니다.
+
 기존 `executions.csv`/`result.json` 누적 상태를 무시하고 새로 시작하려면:
 
 ```bash
@@ -93,6 +95,40 @@ PY
 ```bash
 python3 -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
 python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+## Electron GUI
+
+데스크톱 UI에서 아래를 한 번에 제어할 수 있습니다.
+
+- 매매 시작/중지
+- 실시간 로그 확인
+- 현재 잔고/실현손익/승률/미정산 노출 확인
+- 수동 1회 포지션 진입(UP/DOWN)
+- Live 모드 선택 시 bankroll 자동 조회/반영(계좌 balance/allowance 기반)
+
+실행:
+
+```bash
+cd desktop
+npm install
+npm run start
+```
+
+수동 포지션 진입 CLI만 단독으로 쓰고 싶으면:
+
+```bash
+uv run --python 3.11 python -m pm1h_edge_trader.manual_entry \
+  --mode dry-run \
+  --direction up \
+  --usd 50
+```
+
+API 크리덴셜 자동 생성/반영:
+
+```bash
+# POLYMARKET_PRIVATE_KEY / POLYMARKET_FUNDER 가 환경변수에 설정되어 있어야 함
+uv run --python 3.11 pm1h-derive-api-creds --write-env
 ```
 
 ## 참고

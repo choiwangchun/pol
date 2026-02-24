@@ -25,6 +25,7 @@ from .engine import DecisionConfig as ProbabilityDecisionConfig
 from .engine import DecisionEngine as ProbabilityDecisionEngine
 from .engine import DecisionOutcome
 from .execution import (
+    ActiveIntent,
     DryRunExecutionAdapter,
     ExecutionAction,
     ExecutionActionType,
@@ -40,8 +41,10 @@ from .feeds import BinanceUnderlyingAdapter, ClobOrderbookAdapter
 from .feeds.http_client import AsyncJsonHttpClient
 from .feeds.models import BestQuote, UnderlyingSnapshot
 from .logger import CSVExecutionReporter, ExecutionLogRecord
+from .live_balance import LiveBalanceSnapshot, fetch_live_balance_snapshot
 from .markets import FeeRateGuardClient, GammaMarketDiscoveryClient, MarketCandidate
 from .paper import PaperResultTracker, PaperSettlementCoordinator, PolymarketMarketResolutionResolver
+from .policy import PolicyBanditConfig, PolicyBanditController, PolicySelection
 
 LOGGER = logging.getLogger("pm1h_edge_trader")
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
@@ -106,7 +109,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-order-notional",
         type=float,
-        default=5.0,
+        default=0.3,
         help="Minimum order notional in quote currency.",
     )
     parser.add_argument(
@@ -203,6 +206,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Refresh cadence for Deribit DVOL polling.",
     )
     parser.add_argument(
+        "--enable-policy-bandit",
+        action="store_true",
+        help="Enable contextual bandit policy profile selection.",
+    )
+    parser.add_argument(
+        "--policy-shadow-mode",
+        action="store_true",
+        help="Select policy profiles for logging only and execute balanced profile.",
+    )
+    parser.add_argument(
+        "--policy-exploration-epsilon",
+        type=float,
+        default=0.05,
+        help="Exploration epsilon for policy bandit in dry-run mode.",
+    )
+    parser.add_argument(
+        "--policy-ucb-c",
+        type=float,
+        default=1.0,
+        help="UCB exploration coefficient for policy profile scoring.",
+    )
+    parser.add_argument(
+        "--policy-reward-turnover-lambda",
+        type=float,
+        default=0.0,
+        help="Turnover penalty multiplier in policy reward calculation.",
+    )
+    parser.add_argument(
+        "--policy-reward-risk-penalty",
+        type=float,
+        default=0.0,
+        help="Additional reward penalty applied on risk-limit breach.",
+    )
+    parser.add_argument(
+        "--policy-vol-ratio-threshold",
+        type=float,
+        default=1.1,
+        help="rv_short/rv_long threshold for high-vol context bucket.",
+    )
+    parser.add_argument(
+        "--policy-spread-tight-threshold",
+        type=float,
+        default=0.03,
+        help="Max spread considered tight for context bucketing.",
+    )
+    parser.add_argument(
         "--disable-websocket",
         action="store_true",
         help="Disable websocket and use REST polling only.",
@@ -238,6 +287,20 @@ def configure_logging(config: AppConfig) -> None:
 class FeeState:
     max_fee_rate: float
     checked_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class AdaptiveSigmaSnapshot:
+    long_sigma: float
+    short_sigma: float
+    blended_sigma: float
+    short_weight: float
+
+
+@dataclass(slots=True, frozen=True)
+class LiveFillSnapshot:
+    matched_size: float
+    price: float | None
 
 
 class RealizedVolEstimator:
@@ -317,8 +380,8 @@ class AdaptiveRealizedVolEstimator:
     def __init__(
         self,
         *,
-        long_horizon: RealizedVolEstimator,
-        short_horizon: RealizedVolEstimator,
+        long_horizon: object,
+        short_horizon: object,
         tau_switch_seconds: float,
         floor_sigma: float,
         fallback_sigma: float,
@@ -329,18 +392,32 @@ class AdaptiveRealizedVolEstimator:
         self._floor_sigma = max(0.0, floor_sigma)
         self._fallback_sigma = max(fallback_sigma, self._floor_sigma)
 
-    async def get_sigma(self, *, now: datetime, seconds_to_expiry: float) -> float:
+    async def get_snapshot(self, *, now: datetime, seconds_to_expiry: float) -> AdaptiveSigmaSnapshot:
         try:
-            long_sigma = await self._long_horizon.get_sigma(now=now)
-            short_sigma = await self._short_horizon.get_sigma(now=now)
+            long_sigma = float(await self._long_horizon.get_sigma(now=now))
+            short_sigma = float(await self._short_horizon.get_sigma(now=now))
             weight_short = _tau_short_weight(seconds_to_expiry, self._tau_switch_seconds)
             variance = ((1.0 - weight_short) * (long_sigma**2)) + (weight_short * (short_sigma**2))
-            sigma = sqrt(max(variance, 0.0))
-            if sigma <= 0.0:
-                return self._fallback_sigma
-            return max(self._floor_sigma, sigma)
+            blended = sqrt(max(variance, 0.0))
+            if blended <= 0.0:
+                blended = self._fallback_sigma
+            return AdaptiveSigmaSnapshot(
+                long_sigma=max(self._floor_sigma, long_sigma),
+                short_sigma=max(self._floor_sigma, short_sigma),
+                blended_sigma=max(self._floor_sigma, blended),
+                short_weight=weight_short,
+            )
         except Exception:
-            return self._fallback_sigma
+            return AdaptiveSigmaSnapshot(
+                long_sigma=self._fallback_sigma,
+                short_sigma=self._fallback_sigma,
+                blended_sigma=self._fallback_sigma,
+                short_weight=0.0,
+            )
+
+    async def get_sigma(self, *, now: datetime, seconds_to_expiry: float) -> float:
+        snapshot = await self.get_snapshot(now=now, seconds_to_expiry=seconds_to_expiry)
+        return snapshot.blended_sigma
 
 
 class DeribitVolatilityIndexEstimator:
@@ -413,7 +490,7 @@ class PM1HEdgeTraderApp:
         self._fee_guard = FeeRateGuardClient(base_url=config.polymarket.clob_rest_base_url)
         self._reporter = CSVExecutionReporter(config.logging.execution_csv_path)
 
-        decision_cfg = ProbabilityDecisionConfig(
+        self._base_decision_config = ProbabilityDecisionConfig(
             sigma_weight=config.volatility.sigma_weight,
             edge_min=config.decision.edge_min,
             edge_buffer_up=config.decision.edge_buffer_up,
@@ -424,7 +501,7 @@ class PM1HEdgeTraderApp:
             f_cap=config.risk.f_cap,
             min_order_size=config.risk.min_order_notional,
         )
-        self._probability_engine = ProbabilityDecisionEngine(decision_cfg)
+        self._probability_engine = ProbabilityDecisionEngine(self._base_decision_config)
 
         execution_cfg = ExecutionEngineConfig(
             requote_interval_s=config.safety.requote_interval_seconds,
@@ -487,6 +564,24 @@ class PM1HEdgeTraderApp:
                 floor=config.volatility.deribit_iv_floor,
                 cap=config.volatility.deribit_iv_cap,
             )
+        self._policy_controller: PolicyBanditController | None = None
+        if config.policy.enabled:
+            self._policy_controller = PolicyBanditController(
+                config=PolicyBanditConfig(
+                    enabled=config.policy.enabled,
+                    shadow_mode=config.policy.shadow_mode,
+                    exploration_epsilon=config.policy.exploration_epsilon,
+                    ucb_c=config.policy.ucb_c,
+                    reward_turnover_lambda=config.policy.reward_turnover_lambda,
+                    reward_risk_penalty=config.policy.reward_risk_penalty,
+                    vol_ratio_threshold=config.policy.vol_ratio_threshold,
+                    spread_tight_threshold=config.policy.spread_tight_threshold,
+                    dataset_path=config.logging.root_dir / config.policy.dataset_csv_name,
+                    state_path=config.logging.root_dir / config.policy.state_json_name,
+                ),
+                base_decision_config=self._base_decision_config,
+            )
+        self._latest_policy_selection: PolicySelection | None = None
 
         self._market: MarketCandidate | None = None
         self._orderbook: ClobOrderbookAdapter | None = None
@@ -567,6 +662,8 @@ class PM1HEdgeTraderApp:
                 LOGGER.info("fresh_start enabled: ignoring previous executions.csv state")
                 _reset_execution_csv(self._config.logging.execution_csv_path)
                 self._paper_result_tracker.write_snapshot()
+                if self._policy_controller is not None:
+                    self._policy_controller.reset()
             else:
                 self._paper_result_tracker.bootstrap_from_csv(self._config.logging.execution_csv_path)
 
@@ -653,6 +750,7 @@ class PM1HEdgeTraderApp:
         self._near_expiry_cleanup_done = False
         self._next_heartbeat_check = None
         self._next_open_order_reconcile_check = None
+        self._latest_policy_selection = None
         self._market = None
 
     async def _tick_once(self, *, tick_count: int) -> bool:
@@ -683,16 +781,49 @@ class PM1HEdgeTraderApp:
 
         decision: DecisionOutcome | None = None
         sigma = self._config.volatility.rv_fallback
+        rv_long = sigma
+        rv_short = sigma
         dynamic_iv: float | None = self._config.volatility.iv_override
+        selected_profile_id = "P2_BALANCED"
+        applied_profile_id = "P2_BALANCED"
+        self._latest_policy_selection = None
         entry_block_reason = self._entry_block_reason(now=now, market_id=market.market_id)
         if data_ready and tau_years > 0.0:
-            sigma = await self._rv_estimator.get_sigma(
+            rv_snapshot = await self._rv_estimator.get_snapshot(
                 now=now,
                 seconds_to_expiry=seconds_to_expiry,
             )
+            rv_long = rv_snapshot.long_sigma
+            rv_short = rv_snapshot.short_sigma
+            sigma = rv_snapshot.blended_sigma
             if dynamic_iv is None and self._iv_estimator is not None:
                 dynamic_iv = await self._iv_estimator.get_iv(now=now)
-            decision = self._probability_engine.decide(
+            decision_engine = self._probability_engine
+            if self._policy_controller is not None:
+                policy_selection = self._policy_controller.select_profile(
+                    timestamp=now,
+                    market_id=market.market_id,
+                    seconds_to_expiry=seconds_to_expiry,
+                    rv_long=rv_long,
+                    rv_short=rv_short,
+                    sigma=sigma,
+                    iv=dynamic_iv,
+                    spot=underlying.last_price or 0.0,
+                    strike=underlying.candle_open or 0.0,
+                    bid_up=up_quote.best_bid or 0.0,
+                    ask_up=up_quote.best_ask or 0.0,
+                    bid_down=down_quote.best_bid or 0.0,
+                    ask_down=down_quote.best_ask or 0.0,
+                    bankroll_at_entry=self._decision_bankroll(),
+                    allow_exploration=self._config.mode == RuntimeMode.DRY_RUN,
+                )
+                self._latest_policy_selection = policy_selection
+                selected_profile_id = policy_selection.chosen_profile_id
+                applied_profile_id = policy_selection.applied_profile_id
+                decision_engine = ProbabilityDecisionEngine(
+                    self._policy_controller.decision_config_for(applied_profile_id)
+                )
+            decision = decision_engine.decide(
                 spot=underlying.last_price or 0.0,
                 strike=underlying.candle_open or 0.0,
                 tau=tau_years,
@@ -766,6 +897,8 @@ class PM1HEdgeTraderApp:
             down_quote=down_quote,
             fee_rate=max_fee_rate,
             action_count=len(all_actions),
+            selected_profile_id=selected_profile_id,
+            applied_profile_id=applied_profile_id,
         )
         await self._reconcile_paper_settlements(now=now)
         return False
@@ -901,6 +1034,11 @@ class PM1HEdgeTraderApp:
             self._reporter.append(paper_fill_record)
             if self._paper_result_tracker is not None:
                 self._paper_result_tracker.on_record(paper_fill_record)
+            if self._policy_controller is not None:
+                self._policy_controller.on_fill(
+                    paper_fill_record,
+                    selection=self._latest_policy_selection,
+                )
 
     def _build_paper_fill_record(
         self,
@@ -966,6 +1104,16 @@ class PM1HEdgeTraderApp:
             for record in appended_records:
                 if self._paper_result_tracker is not None:
                     self._paper_result_tracker.on_record(record)
+                if self._policy_controller is not None:
+                    reward = self._policy_controller.on_settlement(
+                        record,
+                        risk_limit_breach=(
+                            self._external_kill_switch_latched
+                            or self._execution_engine.kill_switch.active
+                        ),
+                    )
+                    if reward is not None:
+                        LOGGER.info("policy_reward order_id=%s reward=%.8f", record.order_id, reward)
             appended = len(appended_records)
             if appended > 0:
                 LOGGER.info("paper_settle_appended=%s", appended)
@@ -984,6 +1132,8 @@ class PM1HEdgeTraderApp:
         down_quote: BestQuote | None,
         fee_rate: float,
         action_count: int,
+        selected_profile_id: str,
+        applied_profile_id: str,
     ) -> None:
         q_up = decision.q_up if decision is not None else 0.5
         edge_up = decision.up.edge if decision is not None else 0.0
@@ -994,7 +1144,7 @@ class PM1HEdgeTraderApp:
                 "tick=%s q_up=%.4f tau_years=%.8f ask_up=%.4f ask_down=%.4f "
                 "edge_up=%.4f edge_down=%.4f "
                 "kelly_up=%.4f kelly_down=%.4f notional_up=%.2f notional_down=%.2f "
-                "fee=%.6f actions=%s kill_switch=%s"
+                "fee=%.6f actions=%s kill_switch=%s policy_selected=%s policy_applied=%s"
             ),
             tick_count,
             q_up,
@@ -1010,6 +1160,8 @@ class PM1HEdgeTraderApp:
             fee_rate,
             action_count,
             self._execution_engine.kill_switch.active,
+            selected_profile_id,
+            applied_profile_id,
         )
 
     def _require_market(self) -> MarketCandidate:
@@ -1090,7 +1242,9 @@ class PM1HEdgeTraderApp:
             self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
             return
 
-        local_open_ids = {intent.order_id for intent in self._execution_engine.active_intents().values()}
+        active_intents = self._execution_engine.active_intents()
+        local_open_ids = {intent.order_id for intent in active_intents.values()}
+        intent_by_order_id = {intent.order_id: intent for intent in active_intents.values()}
         orphaned_ids = venue_open_ids - local_open_ids
         missing_ids = local_open_ids - venue_open_ids
 
@@ -1114,6 +1268,20 @@ class PM1HEdgeTraderApp:
             break
 
         for order_id in missing_ids:
+            intent = intent_by_order_id.get(order_id)
+            if intent is None:
+                self._execution_engine.drop_intent(order_id)
+                continue
+            fill_snapshot = self._poll_live_fill_snapshot(order_id=order_id, intent=intent)
+            if fill_snapshot is not None:
+                self._execution_engine.mark_order_filled(order_id)
+                self._append_live_fill_record(
+                    now=now,
+                    order_id=order_id,
+                    intent=intent,
+                    fill_snapshot=fill_snapshot,
+                )
+                continue
             self._execution_engine.drop_intent(order_id)
 
         if orphaned_ids or missing_ids:
@@ -1125,6 +1293,120 @@ class PM1HEdgeTraderApp:
 
         interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
         self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
+
+    def _poll_live_fill_snapshot(self, *, order_id: str, intent: ActiveIntent) -> LiveFillSnapshot | None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return None
+        adapter = self._execution_engine._adapter
+        get_order = getattr(adapter, "get_order", None)
+        if not callable(get_order):
+            return None
+        try:
+            order_payload = get_order(order_id)
+        except Exception:
+            return None
+        if not isinstance(order_payload, Mapping):
+            return None
+
+        order_view = _extract_live_order_view(order_payload)
+        if order_view is None:
+            return None
+
+        matched_size = _extract_float_by_keys(order_view, ("size_matched", "matched_size")) or 0.0
+        price = _extract_float_by_keys(order_view, ("price",))
+        status = _extract_text_by_keys(order_view, ("status",))
+        associated_trade_ids = _extract_trade_ids_by_keys(order_view, ("associate_trades",))
+
+        trade_price, trade_size = self._poll_live_trade_details(
+            order_id=order_id,
+            trade_ids=associated_trade_ids,
+        )
+        if trade_size is not None and trade_size > 0.0:
+            matched_size = trade_size
+        if trade_price is not None and trade_price > 0.0:
+            price = trade_price
+
+        if matched_size <= 0.0 and _is_live_order_filled_status(status):
+            matched_size = intent.size
+        if matched_size <= 0.0:
+            return None
+        bounded_size = min(max(0.0, matched_size), max(0.0, intent.size))
+        if bounded_size <= 0.0:
+            return None
+        return LiveFillSnapshot(matched_size=bounded_size, price=price)
+
+    def _poll_live_trade_details(
+        self,
+        *,
+        order_id: str,
+        trade_ids: Sequence[str],
+    ) -> tuple[float | None, float | None]:
+        if not trade_ids:
+            return None, None
+        adapter = self._execution_engine._adapter
+        get_trade = getattr(adapter, "get_trade", None)
+        if not callable(get_trade):
+            return None, None
+
+        total_size = 0.0
+        total_notional = 0.0
+        fallback_price: float | None = None
+        for trade_id in trade_ids:
+            try:
+                payload = get_trade(trade_id)
+            except Exception:
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            trade_view = _extract_live_trade_view(payload)
+            if trade_view is None:
+                continue
+            price = _extract_float_by_keys(trade_view, ("price",))
+            if price is not None and price > 0.0:
+                fallback_price = price
+            matched_amount = _extract_trade_match_amount(trade_view, order_id=order_id)
+            if price is None or price <= 0.0:
+                continue
+            if matched_amount is None or matched_amount <= 0.0:
+                continue
+            total_size += matched_amount
+            total_notional += matched_amount * price
+
+        if total_size > 0.0:
+            return (total_notional / total_size), total_size
+        return fallback_price, None
+
+    def _append_live_fill_record(
+        self,
+        *,
+        now: datetime,
+        order_id: str,
+        intent: ActiveIntent,
+        fill_snapshot: LiveFillSnapshot,
+    ) -> None:
+        fill_price = fill_snapshot.price if fill_snapshot.price is not None and fill_snapshot.price > 0.0 else intent.price
+        record = ExecutionLogRecord(
+            timestamp=now,
+            market_id=intent.market_id,
+            K=0.0,
+            S_t=0.0,
+            tau=0.0,
+            sigma=0.0,
+            q_up=0.5,
+            bid_up=0.0,
+            ask_up=0.0,
+            bid_down=0.0,
+            ask_down=0.0,
+            edge=intent.edge,
+            order_id=order_id,
+            side=_side_to_label(intent.side),
+            price=fill_price,
+            size=fill_snapshot.matched_size,
+            status="live_fill",
+            settlement_outcome=None,
+            pnl=None,
+        )
+        self._reporter.append(record)
 
     def _enforce_near_expiry_cleanup(
         self,
@@ -1239,13 +1521,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     live_auth = load_polymarket_live_auth_from_env(os.environ)
+    selected_mode = RuntimeMode(args.mode)
+    live_balance: LiveBalanceSnapshot | None = None
+    effective_bankroll = args.bankroll
+    if selected_mode == RuntimeMode.LIVE:
+        validate_live_mode_credentials(AppConfig(mode=RuntimeMode.LIVE, polymarket_live_auth=live_auth))
+        live_balance = fetch_live_balance_snapshot(
+            auth=live_auth,
+            host="https://clob.polymarket.com",
+        )
+        effective_bankroll = live_balance.bankroll
     config = build_config(
-        mode=RuntimeMode(args.mode),
+        mode=selected_mode,
         binance_symbol=args.binance_symbol,
         market_slug=args.market_slug,
         tick_seconds=args.tick_seconds,
         max_ticks=args.max_ticks,
-        bankroll=args.bankroll,
+        bankroll=effective_bankroll,
         edge_min=args.edge_min,
         edge_buffer=args.edge_buffer,
         cost_rate=args.cost_rate,
@@ -1268,12 +1560,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         deribit_iv_resolution_minutes=args.deribit_iv_resolution_minutes,
         deribit_iv_lookback_hours=args.deribit_iv_lookback_hours,
         deribit_iv_refresh_seconds=args.deribit_iv_refresh_seconds,
+        enable_policy_bandit=args.enable_policy_bandit,
+        policy_shadow_mode=args.policy_shadow_mode,
+        policy_exploration_epsilon=args.policy_exploration_epsilon,
+        policy_ucb_c=args.policy_ucb_c,
+        policy_reward_turnover_lambda=args.policy_reward_turnover_lambda,
+        policy_reward_risk_penalty=args.policy_reward_risk_penalty,
+        policy_vol_ratio_threshold=args.policy_vol_ratio_threshold,
+        policy_spread_tight_threshold=args.policy_spread_tight_threshold,
         log_dir=args.log_dir,
         enable_websocket=not args.disable_websocket,
         fresh_start=args.fresh_start,
         polymarket_live_auth=live_auth,
     )
     configure_logging(config)
+    if live_balance is not None:
+        LOGGER.info(
+            "live_bankroll_auto balance=%.6f allowance=%.6f bankroll=%.6f",
+            live_balance.balance or 0.0,
+            live_balance.allowance or 0.0,
+            live_balance.bankroll,
+        )
     try:
         validate_live_mode_credentials(config)
         asyncio.run(run_async(config))
@@ -1521,6 +1828,101 @@ def _tick_decision_metrics(decision: DecisionOutcome | None) -> dict[str, float]
         "up_notional": decision.up.order_size,
         "down_notional": decision.down.order_size,
     }
+
+
+def _extract_live_order_view(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    order = payload.get("order")
+    if isinstance(order, Mapping):
+        return order
+    if _extract_text_by_keys(payload, ("status",)) is not None:
+        return payload
+    for key in ("data", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            nested_order = _extract_live_order_view(nested)
+            if nested_order is not None:
+                return nested_order
+    return None
+
+
+def _extract_live_trade_view(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    if _extract_text_by_keys(payload, ("id", "trade_id", "tradeID")) is not None:
+        return payload
+    for key in ("trade", "data", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            nested_trade = _extract_live_trade_view(nested)
+            if nested_trade is not None:
+                return nested_trade
+        if isinstance(nested, list):
+            for item in nested:
+                if not isinstance(item, Mapping):
+                    continue
+                nested_trade = _extract_live_trade_view(item)
+                if nested_trade is not None:
+                    return nested_trade
+    return None
+
+
+def _extract_text_by_keys(payload: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    return None
+
+
+def _extract_float_by_keys(payload: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        parsed = _safe_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_trade_ids_by_keys(payload: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            collected: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    continue
+                normalized = item.strip()
+                if normalized:
+                    collected.append(normalized)
+            if collected:
+                return collected
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return [normalized]
+    return []
+
+
+def _extract_trade_match_amount(trade_view: Mapping[str, Any], *, order_id: str) -> float | None:
+    maker_orders = trade_view.get("maker_orders")
+    if isinstance(maker_orders, list):
+        for maker_order in maker_orders:
+            if not isinstance(maker_order, Mapping):
+                continue
+            maker_order_id = _extract_text_by_keys(maker_order, ("order_id", "id", "orderId"))
+            if maker_order_id is None or maker_order_id != order_id:
+                continue
+            matched = _extract_float_by_keys(maker_order, ("matched_amount", "size", "amount"))
+            if matched is not None and matched > 0.0:
+                return matched
+    return _extract_float_by_keys(trade_view, ("matched_amount", "size", "amount"))
+
+
+def _is_live_order_filled_status(status: str | None) -> bool:
+    if status is None:
+        return False
+    normalized = status.strip().lower()
+    return normalized in {"matched", "filled", "executed", "confirmed", "mined"}
 
 
 def _reset_execution_csv(path: Path) -> None:

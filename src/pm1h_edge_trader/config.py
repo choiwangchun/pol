@@ -84,11 +84,25 @@ class DecisionConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class PolicyConfig:
+    enabled: bool = False
+    shadow_mode: bool = False
+    exploration_epsilon: float = 0.05
+    ucb_c: float = 1.0
+    reward_turnover_lambda: float = 0.0
+    reward_risk_penalty: float = 0.0
+    vol_ratio_threshold: float = 1.1
+    spread_tight_threshold: float = 0.03
+    dataset_csv_name: str = "policy_dataset.csv"
+    state_json_name: str = "policy_state.json"
+
+
+@dataclass(slots=True, frozen=True)
 class RiskConfig:
     bankroll: float = 10_000.0
     kelly_fraction: float = 0.25
     f_cap: float = 0.05
-    min_order_notional: float = 5.0
+    min_order_notional: float = 0.3
     max_market_notional: float = 2_500.0
     max_daily_loss: float = 2_000.0
     max_entries_per_market: int = 1
@@ -141,6 +155,7 @@ class AppConfig:
     binance: BinanceConfig = field(default_factory=BinanceConfig)
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -183,6 +198,14 @@ def build_config(
     deribit_iv_resolution_minutes: int | None = None,
     deribit_iv_lookback_hours: int | None = None,
     deribit_iv_refresh_seconds: float | None = None,
+    enable_policy_bandit: bool = False,
+    policy_shadow_mode: bool = False,
+    policy_exploration_epsilon: float | None = None,
+    policy_ucb_c: float | None = None,
+    policy_reward_turnover_lambda: float | None = None,
+    policy_reward_risk_penalty: float | None = None,
+    policy_vol_ratio_threshold: float | None = None,
+    policy_spread_tight_threshold: float | None = None,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
 ) -> AppConfig:
@@ -221,6 +244,16 @@ def build_config(
             edge_buffer_down=edge_buffer,
             cost_rate_up=max(0.0, cost_rate),
             cost_rate_down=max(0.0, cost_rate),
+        ),
+        policy=PolicyConfig(
+            enabled=enable_policy_bandit,
+            shadow_mode=policy_shadow_mode,
+            exploration_epsilon=min(1.0, max(0.0, policy_exploration_epsilon or 0.05)),
+            ucb_c=max(0.0, policy_ucb_c or 1.0),
+            reward_turnover_lambda=max(0.0, policy_reward_turnover_lambda or 0.0),
+            reward_risk_penalty=max(0.0, policy_reward_risk_penalty or 0.0),
+            vol_ratio_threshold=max(1.0, policy_vol_ratio_threshold or 1.1),
+            spread_tight_threshold=max(0.0, policy_spread_tight_threshold or 0.03),
         ),
         risk=RiskConfig(
             bankroll=bankroll,

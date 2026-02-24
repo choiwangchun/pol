@@ -4,6 +4,9 @@ Version: 0.1.0
 Summary: Minimal MVP scaffold for PM-1H Edge Trader.
 Requires-Python: >=3.11
 Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: py-clob-client
+Dynamic: license-file
 
 # PM-1H Edge Trader (MVP)
 
@@ -46,6 +49,57 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
   --max-ticks 1
 ```
 
+live 모드(실주문):
+
+```bash
+export POLYMARKET_PRIVATE_KEY=...
+export POLYMARKET_FUNDER=...
+PYTHONPATH=src python -m pm1h_edge_trader.main \
+  --mode live \
+  --max-ticks 1
+```
+
+`--mode live`에서는 CLOB `balance/allowance`를 조회해 bankroll이 자동으로 계좌 기준으로 설정됩니다.
+
+기존 `executions.csv`/`result.json` 누적 상태를 무시하고 새로 시작하려면:
+
+```bash
+PYTHONPATH=src python -m pm1h_edge_trader.main \
+  --mode dry-run \
+  --fresh-start
+```
+
+## Paper 성과 집계 (자동 체결/정산)
+
+`dry-run`에서는 실행 로그에 아래 status가 추가됩니다.
+
+- `paper_fill`: limit가 현재 best ask를 충족해 paper 체결로 간주된 주문
+- `paper_settle`: Polymarket 결과가 확정되어 PnL/승패가 기록된 체결
+- `result.json`: 가상 금고 상태(현재 잔고/실현손익/승률/미정산 체결)를 덮어쓰기 갱신
+
+예: `--bankroll 1000`으로 실행하면 `logs/result.json` 기준으로 아래 값이 누적됩니다.
+
+- `initial_bankroll`
+- `current_balance`
+- `realized_pnl`
+- `settled_trades`, `wins`, `losses`, `win_rate`
+- `unsettled_fills`, `unsettled_notional`
+- `last_event` (`paper_fill` 또는 `paper_settle`)
+
+승률/손익 집계 예시:
+
+```bash
+PYTHONPATH=src python - <<'PY'
+from pm1h_edge_trader.logger import summarize_csv
+
+initial_bankroll = 500.0
+summary = summarize_csv("logs/executions.csv")
+roi = (summary.total_pnl / initial_bankroll * 100.0) if initial_bankroll > 0 else 0.0
+print(f"trades={summary.trade_count} wins={summary.win_count} losses={summary.loss_count}")
+print(f"hit_rate={summary.hit_rate*100:.2f}% total_pnl=${summary.total_pnl:.2f} roi={roi:.2f}%")
+PY
+```
+
 ## 테스트
 
 ```bash
@@ -53,7 +107,42 @@ python3 -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
 python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+## Electron GUI
+
+데스크톱 UI에서 아래를 한 번에 제어할 수 있습니다.
+
+- 매매 시작/중지
+- 실시간 로그 확인
+- 현재 잔고/실현손익/승률/미정산 노출 확인
+- 수동 1회 포지션 진입(UP/DOWN)
+- Live 모드 선택 시 bankroll 자동 조회/반영(계좌 balance/allowance 기반)
+
+실행:
+
+```bash
+cd desktop
+npm install
+npm run start
+```
+
+수동 포지션 진입 CLI만 단독으로 쓰고 싶으면:
+
+```bash
+uv run --python 3.11 python -m pm1h_edge_trader.manual_entry \
+  --mode dry-run \
+  --direction up \
+  --usd 50
+```
+
+API 크리덴셜 자동 생성/반영:
+
+```bash
+# POLYMARKET_PRIVATE_KEY / POLYMARKET_FUNDER 가 환경변수에 설정되어 있어야 함
+uv run --python 3.11 pm1h-derive-api-creds --write-env
+```
+
 ## 참고
 
-- 현재 CLI는 `dry-run`만 지원합니다 (`live`는 인증 주문 어댑터 연동 전 비활성).
+- `live` 모드는 `py-clob-client` 기반으로 연결되어 있으며, 실계정/실주문이 발생할 수 있으므로
+  운영 키/자금/리스크 한도 관리 후 사용해야 합니다.
 - 활성 BTC 1H Up/Down 시장이 없는 시점에는 discovery 단계에서 종료됩니다.

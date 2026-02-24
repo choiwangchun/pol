@@ -1,0 +1,13 @@
+{
+  "name": "pm1h-edge-trader-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron GUI for PM-1H Edge Trader",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.7.7"
+  }
+}
