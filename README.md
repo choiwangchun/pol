@@ -51,6 +51,14 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
 
 `--mode live`에서는 CLOB `balance/allowance`를 조회해 bankroll이 자동으로 계좌 기준으로 설정됩니다.
 
+긴급 중단(Emergency Stop):
+
+```bash
+uv run --python 3.11 pm1h-emergency-stop
+# 또는
+scripts/emergency_stop.sh
+```
+
 Live 모드에서는 자동 Claim(온체인 `redeemPositions`) 루프가 기본 활성화됩니다.
 
 - 기본 주기: 60초
@@ -148,6 +156,20 @@ PY
 ```bash
 python3 -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
 python3 -m unittest discover -s tests -p "test_*.py" -v
+```
+
+## Canary 운영
+
+카나리 런칭 PRD/런북:
+
+- `docs/canary-live-launch-prd.md`
+- `docs/canary-live-runbook.md`
+
+스테이지 실행 스크립트:
+
+```bash
+scripts/canary_stage0_no_trade.sh
+scripts/canary_stage1_tiny_live.sh
 ```
 
 ## Electron GUI

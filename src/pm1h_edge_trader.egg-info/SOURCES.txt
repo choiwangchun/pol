@@ -4,6 +4,7 @@ pyproject.toml
 src/pm1h_edge_trader/__init__.py
 src/pm1h_edge_trader/api_credentials.py
 src/pm1h_edge_trader/config.py
+src/pm1h_edge_trader/emergency_stop.py
 src/pm1h_edge_trader/live_balance.py
 src/pm1h_edge_trader/live_claim.py
 src/pm1h_edge_trader/main.py
@@ -45,8 +46,17 @@ src/pm1h_edge_trader/paper/result_tracker.py
 src/pm1h_edge_trader/paper/settlement.py
 src/pm1h_edge_trader/policy/__init__.py
 src/pm1h_edge_trader/policy/bandit.py
+src/pm1h_edge_trader/positions/__init__.py
+src/pm1h_edge_trader/positions/data_api.py
+src/pm1h_edge_trader/positions/reconciler.py
+src/pm1h_edge_trader/risk/__init__.py
+src/pm1h_edge_trader/risk/circuit_breaker.py
+src/pm1h_edge_trader/strategy/__init__.py
+src/pm1h_edge_trader/strategy/complete_set_arb.py
 tests/test_api_credentials.py
 tests/test_app_runtime_wiring.py
+tests/test_complete_set_arb.py
+tests/test_emergency_stop.py
 tests/test_execution_engine_token_id.py
 tests/test_fresh_start.py
 tests/test_live_balance.py
@@ -59,5 +69,7 @@ tests/test_paper_settlement.py
 tests/test_policy_bandit.py
 tests/test_policy_runtime_wiring.py
 tests/test_polymarket_live_adapter.py
+tests/test_positions_reconciler.py
+tests/test_risk_circuit_breaker.py
 tests/test_tick_summary_logging.py
 tests/test_volatility_pipeline.py
