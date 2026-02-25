@@ -73,6 +73,24 @@ Live 모드에서는 자동 Claim(온체인 `redeemPositions`) 루프가 기본 
 --data-api-base-url https://data-api.polymarket.com
 ```
 
+Safety + Recon + Arb 옵션(기본은 안전/옵트인):
+
+```bash
+--hard-kill-on-daily-loss
+--position-reconcile-interval-seconds 10
+--position-mismatch-policy kill   # kill | block | warn
+--position-size-threshold 0.0001
+
+--enable-complete-set-arb
+--arb-min-profit 0.0
+--arb-max-notional 25
+--arb-fill-timeout-seconds 15
+```
+
+- `kill-switch reason` 확장: `daily_loss_limit`, `bankroll_depleted`, `market_notional_limit_breach`, `position_mismatch`
+- 포지션 리컨실은 Live 지갑 포지션(Data API `/positions`)과 로컬 노출을 비교합니다.
+- complete-set arb는 기본 OFF이며 `ask_up + ask_down < 1`일 때만 페어 매수를 시도합니다.
+
 Live 오더 리컨실 정책(기본값 안전 모드):
 
 - 기본: venue에 orphan open order가 보이면 **자동 취소하지 않고** kill-switch latch + 수동 확인

@@ -47,6 +47,9 @@ from .live_claim import LiveAutoClaimWorker, build_live_auto_claim_worker
 from .markets import FeeRateGuardClient, GammaMarketDiscoveryClient, MarketCandidate
 from .paper import PaperResultTracker, PaperSettlementCoordinator, PolymarketMarketResolutionResolver
 from .policy import PolicyBanditConfig, PolicyBanditController, PolicySelection
+from .positions import DataApiPositionsClient, evaluate_position_mismatch, extract_position_snapshot
+from .risk import CircuitBreakerSnapshot, evaluate_circuit_breaker
+from .strategy import CompleteSetArbDecision, decide_complete_set_arb
 
 LOGGER = logging.getLogger("pm1h_edge_trader")
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
@@ -301,6 +304,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--cancel-orphan-orders",
         action="store_true",
         help="Allow automatic cancellation of venue open orders unknown to the local runtime.",
+    )
+    parser.add_argument(
+        "--hard-kill-on-daily-loss",
+        action="store_true",
+        help="Latch kill switch and cancel orders when daily loss cap is reached.",
+    )
+    parser.add_argument(
+        "--position-reconcile-interval-seconds",
+        type=float,
+        default=10.0,
+        help="Polling interval for live wallet-position reconciliation.",
+    )
+    parser.add_argument(
+        "--position-mismatch-policy",
+        choices=["kill", "block", "warn"],
+        default="kill",
+        help="Action when live wallet positions differ from local bot expectations.",
+    )
+    parser.add_argument(
+        "--position-size-threshold",
+        type=float,
+        default=0.0001,
+        help="Minimum wallet position size used for mismatch checks.",
+    )
+    parser.add_argument(
+        "--enable-complete-set-arb",
+        action="store_true",
+        help="Enable complete-set arbitrage mode (buy UP+DOWN when ask_sum<1).",
+    )
+    parser.add_argument(
+        "--arb-min-profit",
+        type=float,
+        default=0.0,
+        help="Minimum required complete-set profit per pair (1-(ask_up+ask_down)).",
+    )
+    parser.add_argument(
+        "--arb-max-notional",
+        type=float,
+        default=25.0,
+        help="Maximum total notional allocated to one complete-set attempt.",
+    )
+    parser.add_argument(
+        "--arb-fill-timeout-seconds",
+        type=float,
+        default=15.0,
+        help="Timeout for one-leg-only complete-set state before defensive stop.",
     )
     parser.add_argument(
         "--log-dir",
@@ -641,10 +690,14 @@ class PM1HEdgeTraderApp:
         self._near_expiry_cleanup_done = False
         self._next_heartbeat_check: datetime | None = None
         self._next_open_order_reconcile_check: datetime | None = None
+        self._next_position_reconcile_check: datetime | None = None
         self._external_kill_switch_latched = False
+        self._position_mismatch_blocked = False
         self._live_auto_claim_worker: LiveAutoClaimWorker | None = None
         self._next_auto_claim_check: datetime | None = None
         self._auto_claim_init_failed = False
+        self._positions_client: DataApiPositionsClient | None = None
+        self._arb_one_leg_started_at: datetime | None = None
 
         if config.mode == RuntimeMode.DRY_RUN:
             resolver = PolymarketMarketResolutionResolver(
@@ -666,6 +719,9 @@ class PM1HEdgeTraderApp:
                 result_json_path=config.logging.root_dir / "result.json",
                 fill_statuses=("live_fill",),
                 settle_statuses=("live_settle",),
+            )
+            self._positions_client = DataApiPositionsClient(
+                base_url=config.position_reconcile.data_api_base_url,
             )
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -773,6 +829,7 @@ class PM1HEdgeTraderApp:
         self._set_market_tick_sizes(self._discover_market_tick_sizes(market))
         self._next_heartbeat_check = now_ts
         self._next_open_order_reconcile_check = now_ts
+        self._next_position_reconcile_check = now_ts
         self._next_auto_claim_check = now_ts
         await self._refresh_fee_state(force=True, now=now_ts)
         await self._reconcile_paper_settlements(force=True, now=now_ts)
@@ -813,8 +870,11 @@ class PM1HEdgeTraderApp:
         self._near_expiry_cleanup_done = False
         self._next_heartbeat_check = None
         self._next_open_order_reconcile_check = None
+        self._next_position_reconcile_check = None
         self._next_auto_claim_check = None
         self._latest_policy_selection = None
+        self._position_mismatch_blocked = False
+        self._arb_one_leg_started_at = None
         self._market = None
 
     async def _tick_once(self, *, tick_count: int) -> bool:
@@ -826,6 +886,7 @@ class PM1HEdgeTraderApp:
         self._run_live_heartbeat(now=now)
         self._reconcile_live_open_orders(now=now)
         self._run_live_auto_claim(now=now)
+        await self._reconcile_live_positions(now=now)
 
         await self._refresh_fee_state(now=now)
         max_fee_rate = self._fee_state.max_fee_rate if self._fee_state is not None else 0.0
@@ -845,6 +906,7 @@ class PM1HEdgeTraderApp:
         tau_years = seconds_to_expiry / SECONDS_PER_YEAR
 
         decision: DecisionOutcome | None = None
+        arb_decision: CompleteSetArbDecision | None = None
         sigma = self._config.volatility.rv_fallback
         rv_long = sigma
         rv_short = sigma
@@ -852,7 +914,33 @@ class PM1HEdgeTraderApp:
         selected_profile_id = "P2_BALANCED"
         applied_profile_id = "P2_BALANCED"
         self._latest_policy_selection = None
+        decision_bankroll = self._decision_bankroll()
         entry_block_reason = self._entry_block_reason(now=now, market_id=market.market_id)
+        circuit_breaker = evaluate_circuit_breaker(
+            CircuitBreakerSnapshot(
+                daily_realized_pnl=self._daily_realized_pnl(now),
+                max_daily_loss=self._config.risk.max_daily_loss,
+                decision_bankroll=decision_bankroll,
+                market_notional=self._market_effective_notional(market.market_id),
+                max_market_notional=self._config.risk.max_market_notional,
+            )
+        )
+        if circuit_breaker.triggered:
+            should_kill = True
+            if (
+                KillSwitchReason.DAILY_LOSS_LIMIT in circuit_breaker.reasons
+                and not self._config.safety.hard_kill_on_daily_loss
+            ):
+                should_kill = False
+            if should_kill:
+                self._trigger_external_kill_switch(
+                    reason=circuit_breaker.reasons[0],
+                    now=now,
+                    message=(
+                        "Risk circuit breaker triggered "
+                        f"reasons={','.join(reason.value for reason in circuit_breaker.reasons)}"
+                    ),
+                )
         if data_ready and tau_years > 0.0:
             rv_snapshot = await self._rv_estimator.get_snapshot(
                 now=now,
@@ -879,7 +967,7 @@ class PM1HEdgeTraderApp:
                     ask_up=up_quote.best_ask or 0.0,
                     bid_down=down_quote.best_bid or 0.0,
                     ask_down=down_quote.best_ask or 0.0,
-                    bankroll_at_entry=self._decision_bankroll(),
+                    bankroll_at_entry=decision_bankroll,
                     allow_exploration=self._config.mode == RuntimeMode.DRY_RUN,
                 )
                 self._latest_policy_selection = policy_selection
@@ -896,9 +984,30 @@ class PM1HEdgeTraderApp:
                 iv=dynamic_iv,
                 ask_up=up_quote.best_ask or 0.0,
                 ask_down=down_quote.best_ask or 0.0,
-                bankroll=self._decision_bankroll(),
+                bankroll=decision_bankroll,
             )
             sigma = decision.sigma
+            if (
+                self._config.complete_set_arb.enabled
+                and entry_block_reason is None
+                and up_quote is not None
+                and down_quote is not None
+                and up_quote.best_ask is not None
+                and down_quote.best_ask is not None
+            ):
+                remaining = self._market_remaining_notional(market.market_id)
+                arb_max_notional = min(self._config.complete_set_arb.max_notional, remaining)
+                arb_decision = decide_complete_set_arb(
+                    ask_up=up_quote.best_ask,
+                    ask_down=down_quote.best_ask,
+                    bankroll=decision_bankroll,
+                    min_profit=self._config.complete_set_arb.min_profit,
+                    max_notional=arb_max_notional,
+                    min_order_notional=self._config.risk.min_order_notional,
+                )
+                if arb_decision.should_trade:
+                    selected_profile_id = "ARB_COMPLETE_SET"
+                    applied_profile_id = "ARB_COMPLETE_SET"
 
         safety = SafetySurface(
             fee_rate=max_fee_rate,
@@ -907,28 +1016,39 @@ class PM1HEdgeTraderApp:
             book_is_consistent=_is_book_consistent(up_quote, down_quote),
         )
 
-        up_signal = self._build_signal(
-            market_id=market.market_id,
-            token_id=market.token_ids.up_token_id,
-            side_label="up",
-            now=now,
-            seconds_to_expiry=seconds_to_expiry,
-            quote=up_quote,
-            decision=decision,
-            data_ready=data_ready,
-            entry_block_reason=entry_block_reason,
-        )
-        down_signal = self._build_signal(
-            market_id=market.market_id,
-            token_id=market.token_ids.down_token_id,
-            side_label="down",
-            now=now,
-            seconds_to_expiry=seconds_to_expiry,
-            quote=down_quote,
-            decision=decision,
-            data_ready=data_ready,
-            entry_block_reason=entry_block_reason,
-        )
+        if arb_decision is not None and arb_decision.should_trade:
+            up_signal, down_signal = self._build_complete_set_arb_signals(
+                market_id=market.market_id,
+                now=now,
+                seconds_to_expiry=seconds_to_expiry,
+                up_quote=up_quote,
+                down_quote=down_quote,
+                arb=arb_decision,
+                entry_block_reason=entry_block_reason,
+            )
+        else:
+            up_signal = self._build_signal(
+                market_id=market.market_id,
+                token_id=market.token_ids.up_token_id,
+                side_label="up",
+                now=now,
+                seconds_to_expiry=seconds_to_expiry,
+                quote=up_quote,
+                decision=decision,
+                data_ready=data_ready,
+                entry_block_reason=entry_block_reason,
+            )
+            down_signal = self._build_signal(
+                market_id=market.market_id,
+                token_id=market.token_ids.down_token_id,
+                side_label="down",
+                now=now,
+                seconds_to_expiry=seconds_to_expiry,
+                quote=down_quote,
+                decision=decision,
+                data_ready=data_ready,
+                entry_block_reason=entry_block_reason,
+            )
 
         all_actions: list[ExecutionAction] = []
         for signal in (up_signal, down_signal):
@@ -936,6 +1056,7 @@ class PM1HEdgeTraderApp:
             all_actions.extend(result.actions)
         stale_result = self._execution_engine.sweep_stale_intents(now=now)
         all_actions.extend(stale_result.actions)
+        self._guard_complete_set_partial_state(now=now, market_id=market.market_id)
 
         signal_map = {
             Side.BUY: up_signal,
@@ -964,6 +1085,7 @@ class PM1HEdgeTraderApp:
             action_count=len(all_actions),
             selected_profile_id=selected_profile_id,
             applied_profile_id=applied_profile_id,
+            arb_decision=arb_decision,
         )
         await self._reconcile_paper_settlements(now=now)
         return False
@@ -1049,6 +1171,100 @@ class PM1HEdgeTraderApp:
         interval = max(5.0, self._config.auto_claim.interval_seconds)
         self._next_auto_claim_check = now + timedelta(seconds=interval)
 
+    async def _reconcile_live_positions(self, *, now: datetime, force: bool = False) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        if self._positions_client is None:
+            return
+        market = self._market
+        if market is None:
+            return
+        if not force and self._next_position_reconcile_check is not None and now < self._next_position_reconcile_check:
+            return
+
+        user_address = self._config.polymarket_live_auth.funder
+        if not isinstance(user_address, str) or not user_address.strip():
+            interval = max(1.0, self._config.position_reconcile.interval_seconds)
+            self._next_position_reconcile_check = now + timedelta(seconds=interval)
+            return
+
+        try:
+            positions = await self._positions_client.fetch_positions(
+                user_address=user_address,
+                size_threshold=self._config.position_reconcile.size_threshold,
+            )
+            snapshot = extract_position_snapshot(
+                positions,
+                up_token_id=market.token_ids.up_token_id,
+                down_token_id=market.token_ids.down_token_id,
+                size_threshold=self._config.position_reconcile.size_threshold,
+            )
+        except Exception as exc:
+            LOGGER.warning("position_reconcile_failed error=%s", exc)
+            interval = max(1.0, self._config.position_reconcile.interval_seconds)
+            self._next_position_reconcile_check = now + timedelta(seconds=interval)
+            return
+
+        mismatch = evaluate_position_mismatch(
+            snapshot=snapshot,
+            local_has_open_exposure=self._has_local_market_exposure(market.market_id),
+        )
+        policy = self._config.position_reconcile.mismatch_policy
+        if mismatch:
+            if policy == "warn":
+                LOGGER.warning(
+                    "position_reconcile_mismatch policy=warn up_size=%.6f down_size=%.6f",
+                    snapshot.up_size,
+                    snapshot.down_size,
+                )
+            elif policy == "block":
+                self._position_mismatch_blocked = True
+                LOGGER.warning(
+                    "position_reconcile_mismatch policy=block up_size=%.6f down_size=%.6f",
+                    snapshot.up_size,
+                    snapshot.down_size,
+                )
+            else:
+                self._position_mismatch_blocked = True
+                self._trigger_external_kill_switch(
+                    reason=KillSwitchReason.POSITION_MISMATCH,
+                    now=now,
+                    message=(
+                        "position_reconcile_mismatch "
+                        f"up_size={snapshot.up_size:.6f} down_size={snapshot.down_size:.6f}"
+                    ),
+                )
+        elif self._position_mismatch_blocked:
+            self._position_mismatch_blocked = False
+            LOGGER.info("position_reconcile_recovered")
+
+        interval = max(1.0, self._config.position_reconcile.interval_seconds)
+        self._next_position_reconcile_check = now + timedelta(seconds=interval)
+
+    def _guard_complete_set_partial_state(self, *, now: datetime, market_id: str) -> None:
+        if not self._config.complete_set_arb.enabled:
+            self._arb_one_leg_started_at = None
+            return
+        intents = self._execution_engine.active_intents()
+        has_up = (market_id, Side.BUY) in intents
+        has_down = (market_id, Side.SELL) in intents
+        one_leg_only = has_up ^ has_down
+        if not one_leg_only:
+            self._arb_one_leg_started_at = None
+            return
+        if self._arb_one_leg_started_at is None:
+            self._arb_one_leg_started_at = now
+            return
+        elapsed = (now - self._arb_one_leg_started_at).total_seconds()
+        if elapsed < self._config.complete_set_arb.fill_timeout_seconds:
+            return
+        self._trigger_external_kill_switch(
+            reason=KillSwitchReason.POSITION_MISMATCH,
+            now=now,
+            message="complete_set_one_leg_timeout",
+        )
+        self._arb_one_leg_started_at = now
+
     async def _refresh_fee_state(self, *, force: bool = False, now: datetime | None = None) -> None:
         market = self._require_market()
         now_ts = now or utc_now()
@@ -1131,6 +1347,62 @@ class PM1HEdgeTraderApp:
             order_side=VenueOrderSide.BUY,
         )
 
+    def _build_complete_set_arb_signals(
+        self,
+        *,
+        market_id: str,
+        now: datetime,
+        seconds_to_expiry: float,
+        up_quote: BestQuote | None,
+        down_quote: BestQuote | None,
+        arb: CompleteSetArbDecision,
+        entry_block_reason: str | None,
+    ) -> tuple[IntentSignal, IntentSignal]:
+        allow_entry = entry_block_reason is None
+        up_price = (
+            _round_down_to_tick(
+                up_quote.best_ask,
+                self._token_tick_sizes.get(up_quote.token_id, 0.0001),
+            )
+            if up_quote is not None and up_quote.best_ask is not None
+            else None
+        )
+        down_price = (
+            _round_down_to_tick(
+                down_quote.best_ask,
+                self._token_tick_sizes.get(down_quote.token_id, 0.0001),
+            )
+            if down_quote is not None and down_quote.best_ask is not None
+            else None
+        )
+        up_signal = IntentSignal(
+            market_id=market_id,
+            token_id=up_quote.token_id if up_quote is not None else "",
+            side=Side.BUY,
+            edge=arb.profit_per_pair,
+            min_edge=self._config.complete_set_arb.min_profit,
+            desired_price=up_price,
+            size=arb.pair_tokens,
+            seconds_to_expiry=max(seconds_to_expiry, 0.0),
+            signal_ts=now,
+            allow_entry=allow_entry,
+            order_side=VenueOrderSide.BUY,
+        )
+        down_signal = IntentSignal(
+            market_id=market_id,
+            token_id=down_quote.token_id if down_quote is not None else "",
+            side=Side.SELL,
+            edge=arb.profit_per_pair,
+            min_edge=self._config.complete_set_arb.min_profit,
+            desired_price=down_price,
+            size=arb.pair_tokens,
+            seconds_to_expiry=max(seconds_to_expiry, 0.0),
+            signal_ts=now,
+            allow_entry=allow_entry,
+            order_side=VenueOrderSide.BUY,
+        )
+        return up_signal, down_signal
+
     def _report_action(
         self,
         *,
@@ -1157,7 +1429,7 @@ class PM1HEdgeTraderApp:
             ask_up=up_quote.best_ask if up_quote and up_quote.best_ask is not None else 0.0,
             bid_down=down_quote.best_bid if down_quote and down_quote.best_bid is not None else 0.0,
             ask_down=down_quote.best_ask if down_quote and down_quote.best_ask is not None else 0.0,
-            edge=_edge_for_action(action=action, decision=decision),
+            edge=_edge_for_action(action=action, decision=decision, side_signal=side_signal),
             order_id=action.order_id or "-",
             side=_side_to_label(action.side),
             price=side_signal.desired_price if side_signal and side_signal.desired_price is not None else 0.0,
@@ -1167,8 +1439,6 @@ class PM1HEdgeTraderApp:
             pnl=None,
         )
         self._reporter.append(record)
-        if self._paper_result_tracker is not None:
-            self._paper_result_tracker.on_record(record)
         if self._paper_result_tracker is not None:
             self._paper_result_tracker.on_record(record)
 
@@ -1278,6 +1548,7 @@ class PM1HEdgeTraderApp:
         tick_count: int,
         tau_years: float,
         decision: DecisionOutcome | None,
+        arb_decision: CompleteSetArbDecision | None,
         up_quote: BestQuote | None,
         down_quote: BestQuote | None,
         fee_rate: float,
@@ -1286,14 +1557,25 @@ class PM1HEdgeTraderApp:
         applied_profile_id: str,
     ) -> None:
         q_up = decision.q_up if decision is not None else 0.5
-        edge_up = decision.up.edge if decision is not None else 0.0
-        edge_down = decision.down.edge if decision is not None else 0.0
-        metrics = _tick_decision_metrics(decision)
+        if arb_decision is not None and arb_decision.should_trade:
+            edge_up = arb_decision.profit_per_pair
+            edge_down = arb_decision.profit_per_pair
+            metrics = {
+                "up_kelly": 0.0,
+                "down_kelly": 0.0,
+                "up_notional": arb_decision.notional_up,
+                "down_notional": arb_decision.notional_down,
+            }
+        else:
+            edge_up = decision.up.edge if decision is not None else 0.0
+            edge_down = decision.down.edge if decision is not None else 0.0
+            metrics = _tick_decision_metrics(decision)
         LOGGER.info(
             (
                 "tick=%s q_up=%.4f tau_years=%.8f ask_up=%.4f ask_down=%.4f "
                 "edge_up=%.4f edge_down=%.4f "
                 "kelly_up=%.4f kelly_down=%.4f notional_up=%.2f notional_down=%.2f "
+                "arb_active=%s ask_sum=%.4f arb_profit=%.4f "
                 "fee=%.6f actions=%s kill_switch=%s policy_selected=%s policy_applied=%s"
             ),
             tick_count,
@@ -1307,6 +1589,9 @@ class PM1HEdgeTraderApp:
             metrics["down_kelly"],
             metrics["up_notional"],
             metrics["down_notional"],
+            arb_decision.should_trade if arb_decision is not None else False,
+            arb_decision.ask_sum if arb_decision is not None else 0.0,
+            arb_decision.profit_per_pair if arb_decision is not None else 0.0,
             fee_rate,
             action_count,
             self._execution_engine.kill_switch.active,
@@ -1566,6 +1851,8 @@ class PM1HEdgeTraderApp:
             pnl=None,
         )
         self._reporter.append(record)
+        if self._paper_result_tracker is not None:
+            self._paper_result_tracker.on_record(record)
 
     def _enforce_near_expiry_cleanup(
         self,
@@ -1631,6 +1918,8 @@ class PM1HEdgeTraderApp:
     def _entry_block_reason(self, *, now: datetime, market_id: str) -> str | None:
         if self._external_kill_switch_latched:
             return "external_kill_switch_latched"
+        if self._position_mismatch_blocked:
+            return "position_mismatch"
 
         tracker = self._paper_result_tracker
         if tracker is None:
@@ -1659,6 +1948,24 @@ class PM1HEdgeTraderApp:
         remaining = max(0.0, market_cap - used_notional)
         return min(capped, remaining)
 
+    def _daily_realized_pnl(self, now: datetime) -> float:
+        tracker = self._paper_result_tracker
+        if tracker is None:
+            return 0.0
+        return tracker.daily_realized_pnl(now)
+
+    def _market_effective_notional(self, market_id: str) -> float:
+        tracker = self._paper_result_tracker
+        unsettled = tracker.market_unsettled_notional(market_id) if tracker is not None else 0.0
+        return unsettled + self._open_intent_notional_for_market(market_id)
+
+    def _market_remaining_notional(self, market_id: str) -> float:
+        cap = max(0.0, self._config.risk.max_market_notional)
+        if cap <= 0.0:
+            return max(0.0, self._decision_bankroll())
+        used = self._market_effective_notional(market_id)
+        return max(0.0, cap - used)
+
     def _open_intent_notional_total(self) -> float:
         return sum(max(0.0, intent.price * intent.size) for intent in self._execution_engine.active_intents().values())
 
@@ -1671,6 +1978,14 @@ class PM1HEdgeTraderApp:
             for intent in self._execution_engine.active_intents().values()
             if intent.market_id == normalized_market_id
         )
+
+    def _has_local_market_exposure(self, market_id: str) -> bool:
+        if self._open_intent_notional_for_market(market_id) > 0.0:
+            return True
+        tracker = self._paper_result_tracker
+        if tracker is None:
+            return False
+        return tracker.market_unsettled_notional(market_id) > 0.0
 
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -1749,6 +2064,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         auto_claim_tx_timeout_seconds=args.auto_claim_tx_timeout_seconds,
         polygon_rpc_url=args.polygon_rpc_url,
         data_api_base_url=args.data_api_base_url,
+        position_reconcile_interval_seconds=args.position_reconcile_interval_seconds,
+        position_mismatch_policy=args.position_mismatch_policy,
+        position_size_threshold=args.position_size_threshold,
+        hard_kill_on_daily_loss=args.hard_kill_on_daily_loss,
+        enable_complete_set_arb=args.enable_complete_set_arb,
+        arb_min_profit=args.arb_min_profit,
+        arb_max_notional=args.arb_max_notional,
+        arb_fill_timeout_seconds=args.arb_fill_timeout_seconds,
         cancel_orphan_orders=args.cancel_orphan_orders,
         log_dir=args.log_dir,
         enable_websocket=not args.disable_websocket,
@@ -1980,7 +2303,13 @@ def _limit_price(
     return _round_down_to_tick(bounded, tick)
 
 
-def _edge_for_action(action: ExecutionAction, decision: DecisionOutcome | None) -> float:
+def _edge_for_action(
+    action: ExecutionAction,
+    decision: DecisionOutcome | None,
+    side_signal: IntentSignal | None,
+) -> float:
+    if side_signal is not None:
+        return float(side_signal.edge)
     if decision is None or action.side is None:
         return 0.0
     if action.side == Side.BUY:

@@ -43,6 +43,10 @@ class KillSwitchReason(str, Enum):
     BOOK_MISMATCH = "book_mismatch"
     HEARTBEAT_FAILED = "heartbeat_failed"
     ORDER_RECONCILIATION_FAILED = "order_reconciliation_failed"
+    DAILY_LOSS_LIMIT = "daily_loss_limit"
+    BANKROLL_DEPLETED = "bankroll_depleted"
+    MARKET_NOTIONAL_LIMIT_BREACH = "market_notional_limit_breach"
+    POSITION_MISMATCH = "position_mismatch"
 
 
 @dataclass(frozen=True)

@@ -293,6 +293,18 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
         self.assertEqual(reason, "daily_loss_cap_reached")
 
+    def test_entry_block_reason_stops_trading_when_position_mismatch_latched(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE, bankroll=1000.0)
+        app = PM1HEdgeTraderApp(config)
+        app._position_mismatch_blocked = True
+
+        reason = app._entry_block_reason(
+            now=datetime(2026, 2, 21, 6, 30, tzinfo=timezone.utc),
+            market_id="mkt-1",
+        )
+
+        self.assertEqual(reason, "position_mismatch")
+
     def test_build_signal_caps_notional_by_market_limit(self) -> None:
         config = self._build_config(mode=RuntimeMode.DRY_RUN, bankroll=100.0)
         app = PM1HEdgeTraderApp(config)

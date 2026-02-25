@@ -109,6 +109,22 @@ class AutoClaimConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class PositionReconcileConfig:
+    interval_seconds: float = 10.0
+    mismatch_policy: str = "kill"
+    size_threshold: float = 0.0001
+    data_api_base_url: str = "https://data-api.polymarket.com"
+
+
+@dataclass(slots=True, frozen=True)
+class CompleteSetArbConfig:
+    enabled: bool = False
+    min_profit: float = 0.0
+    max_notional: float = 25.0
+    fill_timeout_seconds: float = 15.0
+
+
+@dataclass(slots=True, frozen=True)
 class RiskConfig:
     bankroll: float = 10_000.0
     kelly_fraction: float = 0.25
@@ -138,6 +154,7 @@ class SafetyConfig:
     heartbeat_interval_seconds: float = 5.0
     open_order_reconcile_interval_seconds: float = 10.0
     cancel_orphan_orders: bool = False
+    hard_kill_on_daily_loss: bool = False
     requote_interval_seconds: float = 15.0
     max_intent_age_seconds: float = 45.0
     kill_switch_latch: bool = True
@@ -169,6 +186,8 @@ class AppConfig:
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     auto_claim: AutoClaimConfig = field(default_factory=AutoClaimConfig)
+    position_reconcile: PositionReconcileConfig = field(default_factory=PositionReconcileConfig)
+    complete_set_arb: CompleteSetArbConfig = field(default_factory=CompleteSetArbConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -226,6 +245,14 @@ def build_config(
     auto_claim_tx_timeout_seconds: float = 120.0,
     polygon_rpc_url: str | None = None,
     data_api_base_url: str = "https://data-api.polymarket.com",
+    position_reconcile_interval_seconds: float = 10.0,
+    position_mismatch_policy: str = "kill",
+    position_size_threshold: float = 0.0001,
+    hard_kill_on_daily_loss: bool = False,
+    enable_complete_set_arb: bool = False,
+    arb_min_profit: float = 0.0,
+    arb_max_notional: float = 25.0,
+    arb_fill_timeout_seconds: float = 15.0,
     cancel_orphan_orders: bool = False,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
@@ -237,6 +264,12 @@ def build_config(
     daily_loss_cap = max_daily_loss
     if daily_loss_cap is None:
         daily_loss_cap = max(0.0, bankroll * 0.20)
+    normalized_mismatch_policy = str(position_mismatch_policy).strip().lower() or "kill"
+    if normalized_mismatch_policy not in {"kill", "block", "warn"}:
+        normalized_mismatch_policy = "kill"
+    entry_limit = max(1, max_entries_per_market)
+    if enable_complete_set_arb:
+        entry_limit = max(entry_limit, 2)
 
     return AppConfig(
         mode=mode,
@@ -285,6 +318,18 @@ def build_config(
             polygon_rpc_url=(polygon_rpc_url or os.getenv("POLYGON_RPC_URL") or "https://polygon-rpc.com"),
             data_api_base_url=data_api_base_url.strip() or "https://data-api.polymarket.com",
         ),
+        position_reconcile=PositionReconcileConfig(
+            interval_seconds=max(1.0, position_reconcile_interval_seconds),
+            mismatch_policy=normalized_mismatch_policy,
+            size_threshold=max(0.0, position_size_threshold),
+            data_api_base_url=data_api_base_url.strip() or "https://data-api.polymarket.com",
+        ),
+        complete_set_arb=CompleteSetArbConfig(
+            enabled=enable_complete_set_arb,
+            min_profit=max(0.0, arb_min_profit),
+            max_notional=max(0.0, arb_max_notional),
+            fill_timeout_seconds=max(1.0, arb_fill_timeout_seconds),
+        ),
         risk=RiskConfig(
             bankroll=bankroll,
             kelly_fraction=kelly_fraction,
@@ -292,14 +337,17 @@ def build_config(
             min_order_notional=min_order_notional,
             max_market_notional=max(0.0, market_notional_cap),
             max_daily_loss=max(0.0, daily_loss_cap),
-            max_entries_per_market=max(1, max_entries_per_market),
+            max_entries_per_market=entry_limit,
         ),
         loop=LoopConfig(
             tick_seconds=tick_seconds,
             max_ticks=max_ticks,
             enable_websocket=enable_websocket,
         ),
-        safety=SafetyConfig(cancel_orphan_orders=cancel_orphan_orders),
+        safety=SafetyConfig(
+            cancel_orphan_orders=cancel_orphan_orders,
+            hard_kill_on_daily_loss=hard_kill_on_daily_loss,
+        ),
         logging=LoggingConfig(root_dir=log_dir),
     )
 
