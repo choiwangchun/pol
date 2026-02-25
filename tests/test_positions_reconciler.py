@@ -56,7 +56,7 @@ class PositionReconcilerTests(unittest.TestCase):
         )
         self.assertFalse(snapshot.has_any_position_above_threshold)
 
-    def test_evaluate_position_mismatch_true_when_unexpected_position_exists(self) -> None:
+    def test_evaluate_position_mismatch_true_when_wallet_only_exposure_exists(self) -> None:
         payload = [
             {"asset": "tok-up", "size": "1.2"},
         ]
@@ -66,14 +66,35 @@ class PositionReconcilerTests(unittest.TestCase):
             down_token_id="tok-down",
             size_threshold=0.01,
         )
-        self.assertTrue(
-            evaluate_position_mismatch(
-                snapshot=snapshot,
-                local_has_open_exposure=False,
-            )
+        result = evaluate_position_mismatch(
+            snapshot=snapshot,
+            local_up_size=0.0,
+            local_down_size=0.0,
+            size_threshold=0.01,
+            relative_tolerance=0.05,
         )
+        self.assertTrue(result.mismatch)
+        self.assertEqual(result.reason, "wallet_only_exposure")
 
-    def test_evaluate_position_mismatch_false_when_local_exposure_exists(self) -> None:
+    def test_evaluate_position_mismatch_true_when_local_only_exposure_exists(self) -> None:
+        payload: list[dict[str, str]] = []
+        snapshot = extract_position_snapshot(
+            payload,
+            up_token_id="tok-up",
+            down_token_id="tok-down",
+            size_threshold=0.01,
+        )
+        result = evaluate_position_mismatch(
+            snapshot=snapshot,
+            local_up_size=0.5,
+            local_down_size=0.0,
+            size_threshold=0.01,
+            relative_tolerance=0.05,
+        )
+        self.assertTrue(result.mismatch)
+        self.assertEqual(result.reason, "local_only_exposure")
+
+    def test_evaluate_position_mismatch_true_when_size_diverges(self) -> None:
         payload = [
             {"asset": "tok-up", "size": "1.2"},
         ]
@@ -83,12 +104,35 @@ class PositionReconcilerTests(unittest.TestCase):
             down_token_id="tok-down",
             size_threshold=0.01,
         )
-        self.assertFalse(
-            evaluate_position_mismatch(
-                snapshot=snapshot,
-                local_has_open_exposure=True,
-            )
+        result = evaluate_position_mismatch(
+            snapshot=snapshot,
+            local_up_size=0.8,
+            local_down_size=0.0,
+            size_threshold=0.01,
+            relative_tolerance=0.05,
         )
+        self.assertTrue(result.mismatch)
+        self.assertEqual(result.reason, "size_divergence")
+
+    def test_evaluate_position_mismatch_false_within_tolerance(self) -> None:
+        payload = [
+            {"asset": "tok-up", "size": "1.2"},
+        ]
+        snapshot = extract_position_snapshot(
+            payload,
+            up_token_id="tok-up",
+            down_token_id="tok-down",
+            size_threshold=0.01,
+        )
+        result = evaluate_position_mismatch(
+            snapshot=snapshot,
+            local_up_size=1.18,
+            local_down_size=0.0,
+            size_threshold=0.01,
+            relative_tolerance=0.05,
+        )
+        self.assertFalse(result.mismatch)
+        self.assertEqual(result.reason, "within_tolerance")
 
 
 if __name__ == "__main__":

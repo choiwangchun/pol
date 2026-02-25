@@ -59,6 +59,22 @@ class RiskCircuitBreakerTests(unittest.TestCase):
         self.assertTrue(result.triggered)
         self.assertIn(KillSwitchReason.MARKET_NOTIONAL_LIMIT_BREACH, result.reasons)
 
+    def test_triggers_worst_case_loss_limit(self) -> None:
+        snapshot = CircuitBreakerSnapshot(
+            daily_realized_pnl=0.0,
+            max_daily_loss=200.0,
+            decision_bankroll=100.0,
+            market_notional=100.0,
+            max_market_notional=500.0,
+            worst_case_loss=120.0,
+            max_worst_case_loss=100.0,
+        )
+
+        result = evaluate_circuit_breaker(snapshot)
+
+        self.assertTrue(result.triggered)
+        self.assertIn(KillSwitchReason.WORST_CASE_LOSS_LIMIT, result.reasons)
+
     def test_returns_not_triggered_when_within_limits(self) -> None:
         snapshot = CircuitBreakerSnapshot(
             daily_realized_pnl=-50.0,

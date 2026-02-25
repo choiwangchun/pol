@@ -131,6 +131,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Hard cap for realized daily loss. Default: 20%% of bankroll.",
     )
     parser.add_argument(
+        "--max-worst-case-loss",
+        type=float,
+        default=None,
+        help="Hard cap for worst-case loss proxy (unsettled + open-order notional). Default: 35%% of bankroll.",
+    )
+    parser.add_argument(
         "--max-entries-per-market",
         type=int,
         default=1,
@@ -329,6 +335,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0001,
         help="Minimum wallet position size used for mismatch checks.",
+    )
+    parser.add_argument(
+        "--position-size-relative-tolerance",
+        type=float,
+        default=0.05,
+        help="Relative tolerance for wallet-vs-local position size divergence checks.",
     )
     parser.add_argument(
         "--enable-complete-set-arb",
@@ -929,6 +941,8 @@ class PM1HEdgeTraderApp:
                 decision_bankroll=decision_bankroll,
                 market_notional=self._market_effective_notional(market.market_id),
                 max_market_notional=self._config.risk.max_market_notional,
+                worst_case_loss=self._worst_case_loss_estimate(),
+                max_worst_case_loss=self._config.risk.max_worst_case_loss,
             )
         )
         if circuit_breaker.triggered:
@@ -1072,8 +1086,8 @@ class PM1HEdgeTraderApp:
         )
 
         signal_map = {
-            Side.BUY: up_signal,
-            Side.SELL: down_signal,
+            up_signal.token_id: up_signal,
+            down_signal.token_id: down_signal,
         }
         for action in all_actions:
             self._report_action(
@@ -1220,22 +1234,43 @@ class PM1HEdgeTraderApp:
 
         mismatch = evaluate_position_mismatch(
             snapshot=snapshot,
-            local_has_open_exposure=self._has_local_market_exposure(market.market_id),
+            local_up_size=self._market_side_exposure_tokens(market.market_id, Side.BUY),
+            local_down_size=self._market_side_exposure_tokens(market.market_id, Side.SELL),
+            size_threshold=self._config.position_reconcile.size_threshold,
+            relative_tolerance=self._config.position_reconcile.size_relative_tolerance,
         )
         policy = self._config.position_reconcile.mismatch_policy
-        if mismatch:
+        if mismatch.mismatch:
             if policy == "warn":
                 LOGGER.warning(
-                    "position_reconcile_mismatch policy=warn up_size=%.6f down_size=%.6f",
-                    snapshot.up_size,
-                    snapshot.down_size,
+                    (
+                        "position_reconcile_mismatch policy=warn reason=%s "
+                        "wallet_up=%.6f wallet_down=%.6f local_up=%.6f local_down=%.6f "
+                        "up_diff=%.6f down_diff=%.6f"
+                    ),
+                    mismatch.reason,
+                    mismatch.wallet_up_size,
+                    mismatch.wallet_down_size,
+                    mismatch.local_up_size,
+                    mismatch.local_down_size,
+                    mismatch.up_diff,
+                    mismatch.down_diff,
                 )
             elif policy == "block":
                 self._position_mismatch_blocked = True
                 LOGGER.warning(
-                    "position_reconcile_mismatch policy=block up_size=%.6f down_size=%.6f",
-                    snapshot.up_size,
-                    snapshot.down_size,
+                    (
+                        "position_reconcile_mismatch policy=block reason=%s "
+                        "wallet_up=%.6f wallet_down=%.6f local_up=%.6f local_down=%.6f "
+                        "up_diff=%.6f down_diff=%.6f"
+                    ),
+                    mismatch.reason,
+                    mismatch.wallet_up_size,
+                    mismatch.wallet_down_size,
+                    mismatch.local_up_size,
+                    mismatch.local_down_size,
+                    mismatch.up_diff,
+                    mismatch.down_diff,
                 )
             else:
                 self._position_mismatch_blocked = True
@@ -1244,7 +1279,11 @@ class PM1HEdgeTraderApp:
                     now=now,
                     message=(
                         "position_reconcile_mismatch "
-                        f"up_size={snapshot.up_size:.6f} down_size={snapshot.down_size:.6f}"
+                        f"reason={mismatch.reason} "
+                        f"wallet_up={mismatch.wallet_up_size:.6f} "
+                        f"wallet_down={mismatch.wallet_down_size:.6f} "
+                        f"local_up={mismatch.local_up_size:.6f} "
+                        f"local_down={mismatch.local_down_size:.6f}"
                     ),
                 )
         elif self._position_mismatch_blocked:
@@ -1267,9 +1306,10 @@ class PM1HEdgeTraderApp:
         if not self._config.complete_set_arb.enabled:
             self._arb_one_leg_started_at = None
             return
-        intents = self._execution_engine.active_intents()
-        has_up = (market_id, Side.BUY) in intents
-        has_down = (market_id, Side.SELL) in intents
+        up_token_id = str(up_quote.token_id).strip() if up_quote is not None else ""
+        down_token_id = str(down_quote.token_id).strip() if down_quote is not None else ""
+        has_up = self._has_active_intent_for_token(market_id=market_id, token_id=up_token_id)
+        has_down = self._has_active_intent_for_token(market_id=market_id, token_id=down_token_id)
         one_leg_only = has_up ^ has_down
         if not one_leg_only:
             self._arb_one_leg_started_at = None
@@ -1585,7 +1625,7 @@ class PM1HEdgeTraderApp:
         self,
         *,
         action: ExecutionAction,
-        signal_map: dict[Side, IntentSignal],
+        signal_map: dict[str, IntentSignal],
         market: MarketCandidate,
         underlying: UnderlyingSnapshot,
         up_quote: BestQuote | None,
@@ -1594,7 +1634,14 @@ class PM1HEdgeTraderApp:
         sigma: float,
         decision: DecisionOutcome | None,
     ) -> None:
-        side_signal = signal_map.get(action.side) if action.side is not None else None
+        side_signal: IntentSignal | None = None
+        if action.token_id is not None:
+            side_signal = signal_map.get(str(action.token_id).strip())
+        if side_signal is None and action.side is not None:
+            if action.side == Side.BUY:
+                side_signal = next((signal for signal in signal_map.values() if signal.side == Side.BUY), None)
+            elif action.side == Side.SELL:
+                side_signal = next((signal for signal in signal_map.values() if signal.side == Side.SELL), None)
         record = ExecutionLogRecord(
             timestamp=utc_now(),
             market_id=market.market_id,
@@ -1657,7 +1704,12 @@ class PM1HEdgeTraderApp:
             return None
 
         best_ask: float | None = None
-        if action.side == Side.BUY:
+        normalized_action_token = str(action.token_id or "").strip()
+        if up_quote is not None and str(up_quote.token_id).strip() == normalized_action_token:
+            best_ask = up_quote.best_ask
+        elif down_quote is not None and str(down_quote.token_id).strip() == normalized_action_token:
+            best_ask = down_quote.best_ask
+        elif action.side == Side.BUY:
             best_ask = up_quote.best_ask if up_quote is not None else None
         elif action.side == Side.SELL:
             best_ask = down_quote.best_ask if down_quote is not None else None
@@ -2179,6 +2231,11 @@ class PM1HEdgeTraderApp:
         base = tracker.available_bankroll() if tracker is not None else self._config.risk.bankroll
         return max(0.0, base - self._open_intent_notional_total())
 
+    def _worst_case_loss_estimate(self) -> float:
+        tracker = self._paper_result_tracker
+        unsettled_notional = tracker.unsettled_notional() if tracker is not None else 0.0
+        return max(0.0, unsettled_notional + self._open_intent_notional_total())
+
     def _entry_block_reason(self, *, now: datetime, market_id: str) -> str | None:
         if self._external_kill_switch_latched:
             return "external_kill_switch_latched"
@@ -2255,6 +2312,13 @@ class PM1HEdgeTraderApp:
             return False
         return tracker.market_unsettled_notional(market_id) > 0.0
 
+    def _has_active_intent_for_token(self, *, market_id: str, token_id: str) -> bool:
+        normalized_market_id = str(market_id).strip()
+        normalized_token_id = str(token_id).strip()
+        if not normalized_market_id or not normalized_token_id:
+            return False
+        return (normalized_market_id, normalized_token_id) in self._execution_engine.active_intents()
+
     def _apply_live_market_side_exposure(self, *, market_id: str, side: Side, delta_tokens: float) -> None:
         normalized_market_id = str(market_id).strip()
         if not normalized_market_id:
@@ -2320,6 +2384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_order_notional=args.min_order_notional,
         max_market_notional=args.max_market_notional,
         max_daily_loss=args.max_daily_loss,
+        max_worst_case_loss=args.max_worst_case_loss,
         max_entries_per_market=args.max_entries_per_market,
         rv_fallback=args.rv_fallback,
         rv_interval=args.rv_interval,
@@ -2352,6 +2417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         position_reconcile_interval_seconds=args.position_reconcile_interval_seconds,
         position_mismatch_policy=args.position_mismatch_policy,
         position_size_threshold=args.position_size_threshold,
+        position_size_relative_tolerance=args.position_size_relative_tolerance,
         hard_kill_on_daily_loss=args.hard_kill_on_daily_loss,
         enable_complete_set_arb=args.enable_complete_set_arb,
         arb_min_profit=args.arb_min_profit,

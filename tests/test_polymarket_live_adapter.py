@@ -263,6 +263,22 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         self.assertEqual(order_ids, {"oid-1", "oid-2"})
         self.assertEqual(fake_client.get_orders_calls, 1)
 
+    def test_list_open_order_ids_filters_closed_status_rows(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.get_orders_response = {
+            "data": [
+                {"id": "open-1", "status": "OPEN"},
+                {"id": "open-2", "status": "LIVE"},
+                {"id": "closed-1", "status": "MATCHED"},
+                {"id": "closed-2", "status": "CANCELED"},
+            ]
+        }
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        order_ids = adapter.list_open_order_ids()
+
+        self.assertEqual(order_ids, {"open-1", "open-2"})
+
     def test_cancel_all_orders_returns_canceled_count(self) -> None:
         fake_client = _FakeClient()
         fake_client.cancel_all_response = {"canceledOrderIDs": ["oid-1", "oid-2", "oid-3"]}

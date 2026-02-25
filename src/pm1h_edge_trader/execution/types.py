@@ -46,6 +46,7 @@ class KillSwitchReason(str, Enum):
     DAILY_LOSS_LIMIT = "daily_loss_limit"
     BANKROLL_DEPLETED = "bankroll_depleted"
     MARKET_NOTIONAL_LIMIT_BREACH = "market_notional_limit_breach"
+    WORST_CASE_LOSS_LIMIT = "worst_case_loss_limit"
     POSITION_MISMATCH = "position_mismatch"
 
 
@@ -116,6 +117,7 @@ class ActiveIntent:
 class ExecutionAction:
     action_type: ExecutionActionType
     market_id: str
+    token_id: Optional[str] = None
     side: Optional[Side] = None
     order_id: Optional[str] = None
     reason: Optional[str] = None

@@ -111,7 +111,7 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
             raise RuntimeError(
                 f"Polymarket list_open_order_ids failed ({exc.__class__.__name__})."
             ) from exc
-        return _collect_order_ids(response)
+        return _collect_open_order_ids(response)
 
     def cancel_all_orders(self) -> int:
         self._ensure_authenticated_api_creds()
@@ -377,21 +377,21 @@ def _has_text(value: str | None) -> bool:
     return value is not None and bool(value.strip())
 
 
-def _collect_order_ids(payload: object) -> set[str]:
+def _collect_open_order_ids(payload: object) -> set[str]:
     found: set[str] = set()
     if isinstance(payload, Mapping):
-        for key in ("id", "orderID", "orderId", "order_id"):
-            candidate = payload.get(key)
-            if isinstance(candidate, str):
-                normalized = candidate.strip()
-                if normalized:
-                    found.add(normalized)
+        candidate_id = _extract_direct_str_by_keys(payload, ("id", "orderID", "orderId", "order_id"))
+        status_text = _extract_direct_str_by_keys(payload, ("status", "order_status", "state"))
+        if candidate_id is not None and _is_order_mapping(payload):
+            normalized = candidate_id.strip()
+            if normalized and _is_open_order_status(status_text):
+                found.add(normalized)
         for value in payload.values():
-            found.update(_collect_order_ids(value))
+            found.update(_collect_open_order_ids(value))
         return found
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes, bytearray)):
         for item in payload:
-            found.update(_collect_order_ids(item))
+            found.update(_collect_open_order_ids(item))
         return found
     return found
 
@@ -411,7 +411,45 @@ def _count_canceled_orders(payload: object) -> int:
                 return len([item for item in value if isinstance(item, str) and item.strip()])
         if isinstance(payload.get("success"), bool):
             return 1 if payload.get("success") is True else 0
-    return len(_collect_order_ids(payload))
+    return len(_collect_open_order_ids(payload))
+
+
+def _is_order_mapping(payload: Mapping[str, Any]) -> bool:
+    if any(key in payload for key in ("id", "order_id", "orderID", "orderId")):
+        return True
+    if any(key in payload for key in ("token_id", "tokenID", "asset_id", "market_id", "price", "size", "side")):
+        return True
+    return any(key in payload for key in ("order_id", "orderID", "orderId"))
+
+
+def _extract_direct_str_by_keys(payload: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        candidate = payload.get(key)
+        if isinstance(candidate, str):
+            normalized = candidate.strip()
+            if normalized:
+                return normalized
+    return None
+
+
+def _is_open_order_status(status: str | None) -> bool:
+    if status is None:
+        return True
+    normalized = status.strip().lower()
+    if not normalized:
+        return True
+    closed_markers = {
+        "matched",
+        "filled",
+        "executed",
+        "canceled",
+        "cancelled",
+        "rejected",
+        "expired",
+        "closed",
+        "completed",
+    }
+    return normalized not in closed_markers
 
 
 def _safe_positive_float(value: object) -> float | None:

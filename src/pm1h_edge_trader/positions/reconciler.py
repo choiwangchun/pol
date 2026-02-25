@@ -14,6 +14,18 @@ class PositionSnapshot:
     has_any_position_above_threshold: bool
 
 
+@dataclass(frozen=True)
+class PositionMismatchResult:
+    mismatch: bool
+    reason: str
+    wallet_up_size: float
+    wallet_down_size: float
+    local_up_size: float
+    local_down_size: float
+    up_diff: float
+    down_diff: float
+
+
 def extract_position_snapshot(
     positions: Sequence[Mapping[str, Any]],
     *,
@@ -55,11 +67,73 @@ def extract_position_snapshot(
 def evaluate_position_mismatch(
     *,
     snapshot: PositionSnapshot,
-    local_has_open_exposure: bool,
-) -> bool:
-    if not snapshot.has_any_position_above_threshold:
-        return False
-    return not local_has_open_exposure
+    local_up_size: float,
+    local_down_size: float,
+    size_threshold: float,
+    relative_tolerance: float = 0.05,
+) -> PositionMismatchResult:
+    threshold = max(0.0, float(size_threshold))
+    rel_tol = max(0.0, float(relative_tolerance))
+
+    wallet_up = max(0.0, float(snapshot.up_size))
+    wallet_down = max(0.0, float(snapshot.down_size))
+    local_up = max(0.0, float(local_up_size))
+    local_down = max(0.0, float(local_down_size))
+
+    wallet_has = (wallet_up > threshold) or (wallet_down > threshold)
+    local_has = (local_up > threshold) or (local_down > threshold)
+
+    up_diff = abs(wallet_up - local_up)
+    down_diff = abs(wallet_down - local_down)
+
+    if wallet_has and not local_has:
+        return PositionMismatchResult(
+            mismatch=True,
+            reason="wallet_only_exposure",
+            wallet_up_size=wallet_up,
+            wallet_down_size=wallet_down,
+            local_up_size=local_up,
+            local_down_size=local_down,
+            up_diff=up_diff,
+            down_diff=down_diff,
+        )
+    if local_has and not wallet_has:
+        return PositionMismatchResult(
+            mismatch=True,
+            reason="local_only_exposure",
+            wallet_up_size=wallet_up,
+            wallet_down_size=wallet_down,
+            local_up_size=local_up,
+            local_down_size=local_down,
+            up_diff=up_diff,
+            down_diff=down_diff,
+        )
+
+    if not wallet_has and not local_has:
+        return PositionMismatchResult(
+            mismatch=False,
+            reason="none",
+            wallet_up_size=wallet_up,
+            wallet_down_size=wallet_down,
+            local_up_size=local_up,
+            local_down_size=local_down,
+            up_diff=up_diff,
+            down_diff=down_diff,
+        )
+
+    up_tol = max(threshold, rel_tol * max(wallet_up, local_up))
+    down_tol = max(threshold, rel_tol * max(wallet_down, local_down))
+    mismatch = up_diff > up_tol or down_diff > down_tol
+    return PositionMismatchResult(
+        mismatch=mismatch,
+        reason="size_divergence" if mismatch else "within_tolerance",
+        wallet_up_size=wallet_up,
+        wallet_down_size=wallet_down,
+        local_up_size=local_up,
+        local_down_size=local_down,
+        up_diff=up_diff,
+        down_diff=down_diff,
+    )
 
 
 def _extract_token_id(payload: Mapping[str, Any]) -> str | None:

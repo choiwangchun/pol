@@ -203,7 +203,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             )
         )
 
-        app._execution_engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        app._execution_engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id=handle.order_id,
             market_id="mkt-1",
             token_id="tok-up",
@@ -217,7 +217,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
 
         signal_map = {
-            Side.BUY: IntentSignal(
+            "tok-up": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-up",
                 side=Side.BUY,
@@ -229,7 +229,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
                 signal_ts=now,
                 allow_entry=True,
             ),
-            Side.SELL: IntentSignal(
+            "tok-down": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-down",
                 side=Side.SELL,
@@ -245,6 +245,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         action = ExecutionAction(
             action_type=ExecutionActionType.PLACE,
             market_id="mkt-1",
+            token_id="tok-up",
             side=Side.BUY,
             order_id=handle.order_id,
             reason="new_intent",
@@ -287,7 +288,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
 
         self.assertEqual(adapter.order_status(handle.order_id), OrderStatus.FILLED)
-        self.assertNotIn(("mkt-1", Side.BUY), app._execution_engine.active_intents())
+        self.assertNotIn(("mkt-1", "tok-up"), app._execution_engine.active_intents())
 
     def test_entry_block_reason_stops_trading_when_daily_loss_cap_hit(self) -> None:
         config = self._build_config(mode=RuntimeMode.DRY_RUN, bankroll=1000.0)
@@ -398,7 +399,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         app = PM1HEdgeTraderApp(config)
         now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
 
-        app._execution_engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        app._execution_engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -427,7 +428,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
         app._execution_engine = engine
 
-        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -478,7 +479,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
         app._execution_engine = engine
 
-        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -533,7 +534,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
         app._execution_engine = engine
 
-        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -597,7 +598,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         )
         app._execution_engine = engine
         adapter.open_order_ids = {"live-100"}
-        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -653,7 +654,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         app._token_tick_sizes = {"tok-up": 0.01, "tok-down": 0.01}
         app._arb_one_leg_started_at = now - timedelta(seconds=120)
         app._apply_live_market_side_exposure(market_id="mkt-1", side=Side.BUY, delta_tokens=3.0)
-        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
@@ -717,7 +718,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
                 submitted_at=now,
             )
         )
-        app._execution_engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+        app._execution_engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id=handle.order_id,
             market_id="mkt-1",
             token_id="tok-up",

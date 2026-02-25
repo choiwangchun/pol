@@ -88,7 +88,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
         now = datetime(2026, 2, 23, 9, 30, tzinfo=timezone.utc)
 
         signal_map = {
-            Side.BUY: IntentSignal(
+            "tok-up": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-up",
                 side=Side.BUY,
@@ -100,7 +100,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
                 signal_ts=now,
                 allow_entry=True,
             ),
-            Side.SELL: IntentSignal(
+            "tok-down": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-down",
                 side=Side.SELL,
@@ -116,6 +116,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
         action = ExecutionAction(
             action_type=ExecutionActionType.PLACE,
             market_id="mkt-1",
+            token_id="tok-up",
             side=Side.BUY,
             order_id="dry-77",
             reason="new_intent",

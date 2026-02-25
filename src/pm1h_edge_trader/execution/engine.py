@@ -37,7 +37,7 @@ class LimitOrderExecutionEngine:
         self._now_fn = now_fn
         self._safety_guard = SafetyGuard(self._config)
         self._kill_switch = KillSwitchState()
-        self._active_intents: dict[tuple[str, Side], ActiveIntent] = {}
+        self._active_intents: dict[tuple[str, str], ActiveIntent] = {}
         self._filled_entries_by_market: dict[str, int] = {}
         self._counted_filled_orders: set[str] = set()
 
@@ -45,7 +45,7 @@ class LimitOrderExecutionEngine:
     def kill_switch(self) -> KillSwitchState:
         return self._kill_switch
 
-    def active_intents(self) -> dict[tuple[str, Side], ActiveIntent]:
+    def active_intents(self) -> dict[tuple[str, str], ActiveIntent]:
         return dict(self._active_intents)
 
     def reset_kill_switch(self) -> None:
@@ -129,13 +129,14 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="kill_switch_latched",
                 )
             )
             return ExecutionResult(actions=actions, kill_switch=self._kill_switch)
 
-        key = (signal.market_id, signal.side)
+        key = self._intent_key(signal.market_id, signal.token_id)
         active = self._active_intents.get(key)
 
         if active is not None:
@@ -149,6 +150,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     order_id=active.order_id,
                     reason="intent_unchanged",
@@ -174,7 +176,7 @@ class LimitOrderExecutionEngine:
         now: datetime,
     ) -> list[ExecutionAction]:
         actions: list[ExecutionAction] = []
-        key = (signal.market_id, signal.side)
+        key = self._intent_key(signal.market_id, signal.token_id)
 
         if (
             signal.edge < signal.min_edge
@@ -200,6 +202,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.REQUOTE,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     order_id=active.order_id,
                     reason="requote_interval_elapsed",
@@ -217,6 +220,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="market_entry_limit",
                 )
@@ -227,6 +231,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="non_positive_size",
                 )
@@ -237,6 +242,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="edge_below_threshold",
                 )
@@ -247,6 +253,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="entry_not_allowed",
                 )
@@ -257,6 +264,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="near_expiry_entry_block",
                 )
@@ -267,6 +275,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="missing_desired_price",
                 )
@@ -276,6 +285,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.SKIP,
                     market_id=signal.market_id,
+                    token_id=signal.token_id,
                     side=signal.side,
                     reason="invalid_desired_price",
                 )
@@ -291,7 +301,7 @@ class LimitOrderExecutionEngine:
             order_side=signal.order_side,
         )
         handle = self._adapter.place_limit_order(request)
-        self._active_intents[(signal.market_id, signal.side)] = ActiveIntent(
+        self._active_intents[self._intent_key(signal.market_id, signal.token_id)] = ActiveIntent(
             order_id=handle.order_id,
             market_id=signal.market_id,
             token_id=signal.token_id,
@@ -308,6 +318,7 @@ class LimitOrderExecutionEngine:
             ExecutionAction(
                 action_type=ExecutionActionType.PLACE,
                 market_id=signal.market_id,
+                token_id=signal.token_id,
                 side=signal.side,
                 order_id=handle.order_id,
                 reason="new_intent",
@@ -317,7 +328,7 @@ class LimitOrderExecutionEngine:
     def _cancel_intent(
         self,
         *,
-        key: tuple[str, Side],
+        key: tuple[str, str],
         active: ActiveIntent,
         reason: str,
     ) -> list[ExecutionAction]:
@@ -328,6 +339,7 @@ class LimitOrderExecutionEngine:
             ExecutionAction(
                 action_type=ExecutionActionType.CANCEL,
                 market_id=active.market_id,
+                token_id=active.token_id,
                 side=active.side,
                 order_id=active.order_id,
                 reason=cancel_reason,
@@ -345,6 +357,7 @@ class LimitOrderExecutionEngine:
                 ExecutionAction(
                     action_type=ExecutionActionType.KILL_SWITCH_TRIGGERED,
                     market_id="*",
+                    token_id=None,
                     reason="kill_switch_already_latched",
                 )
             ]
@@ -354,6 +367,7 @@ class LimitOrderExecutionEngine:
             ExecutionAction(
                 action_type=ExecutionActionType.KILL_SWITCH_TRIGGERED,
                 market_id="*",
+                token_id=None,
                 reason=",".join(reason.value for reason in reasons),
             )
         ]
@@ -362,3 +376,7 @@ class LimitOrderExecutionEngine:
             actions.extend(self._cancel_intent(key=key, active=active, reason="kill_switch"))
 
         return actions
+
+    @staticmethod
+    def _intent_key(market_id: str, token_id: str) -> tuple[str, str]:
+        return (str(market_id).strip(), str(token_id).strip())

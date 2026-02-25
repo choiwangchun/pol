@@ -113,6 +113,7 @@ class PositionReconcileConfig:
     interval_seconds: float = 10.0
     mismatch_policy: str = "kill"
     size_threshold: float = 0.0001
+    size_relative_tolerance: float = 0.05
     data_api_base_url: str = "https://data-api.polymarket.com"
 
 
@@ -132,6 +133,7 @@ class RiskConfig:
     min_order_notional: float = 0.3
     max_market_notional: float = 2_500.0
     max_daily_loss: float = 2_000.0
+    max_worst_case_loss: float = 3_500.0
     max_entries_per_market: int = 1
 
 
@@ -219,6 +221,7 @@ def build_config(
     cost_rate: float = 0.005,
     max_market_notional: float | None = None,
     max_daily_loss: float | None = None,
+    max_worst_case_loss: float | None = None,
     max_entries_per_market: int = 1,
     rv_interval: str | None = None,
     rv_ewma_half_life: float | None = None,
@@ -248,6 +251,7 @@ def build_config(
     position_reconcile_interval_seconds: float = 10.0,
     position_mismatch_policy: str = "kill",
     position_size_threshold: float = 0.0001,
+    position_size_relative_tolerance: float = 0.05,
     hard_kill_on_daily_loss: bool = True,
     enable_complete_set_arb: bool = False,
     arb_min_profit: float = 0.0,
@@ -264,6 +268,9 @@ def build_config(
     daily_loss_cap = max_daily_loss
     if daily_loss_cap is None:
         daily_loss_cap = max(0.0, bankroll * 0.20)
+    worst_case_loss_cap = max_worst_case_loss
+    if worst_case_loss_cap is None:
+        worst_case_loss_cap = max(0.0, bankroll * 0.35)
     normalized_mismatch_policy = str(position_mismatch_policy).strip().lower() or "kill"
     if normalized_mismatch_policy not in {"kill", "block", "warn"}:
         normalized_mismatch_policy = "kill"
@@ -322,6 +329,7 @@ def build_config(
             interval_seconds=max(1.0, position_reconcile_interval_seconds),
             mismatch_policy=normalized_mismatch_policy,
             size_threshold=max(0.0, position_size_threshold),
+            size_relative_tolerance=max(0.0, position_size_relative_tolerance),
             data_api_base_url=data_api_base_url.strip() or "https://data-api.polymarket.com",
         ),
         complete_set_arb=CompleteSetArbConfig(
@@ -337,6 +345,7 @@ def build_config(
             min_order_notional=min_order_notional,
             max_market_notional=max(0.0, market_notional_cap),
             max_daily_loss=max(0.0, daily_loss_cap),
+            max_worst_case_loss=max(0.0, worst_case_loss_cap),
             max_entries_per_market=entry_limit,
         ),
         loop=LoopConfig(
