@@ -52,6 +52,8 @@ class _FakeClient:
         self.raise_from_cancel_all: Exception | None = None
         self.raise_from_heartbeat: Exception | None = None
         self.raise_from_get_tick_size: Exception | None = None
+        self.raise_from_get_order: Exception | None = None
+        self.raise_from_get_trades: Exception | None = None
 
     def create_or_derive_api_creds(self) -> object:
         self.create_or_derive_api_creds_calls += 1
@@ -115,10 +117,14 @@ class _FakeClient:
         return self.balance_allowance_response
 
     def get_order(self, order_id: str) -> object:
+        if self.raise_from_get_order is not None:
+            raise self.raise_from_get_order
         self.get_order_calls.append(order_id)
         return self.get_order_response
 
     def get_trades(self, params=None, next_cursor="MA=="):  # type: ignore[no-untyped-def]
+        if self.raise_from_get_trades is not None:
+            raise self.raise_from_get_trades
         self.get_trades_calls.append(params)
         return self.get_trades_response
 
@@ -380,6 +386,14 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["order"]["status"], "MATCHED")
 
+    def test_get_order_raises_runtime_error_on_auth_failure(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.raise_from_get_order = RuntimeError("401 Unauthorized")
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        with self.assertRaises(RuntimeError):
+            adapter.get_order("oid-17")
+
     def test_get_trade_fetches_order_trade_by_id(self) -> None:
         fake_client = _FakeClient()
         fake_client.get_trades_response = [
@@ -394,6 +408,14 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         self.assertIsNotNone(payload)
         assert payload is not None
         self.assertEqual(payload["id"], "trade-2")
+
+    def test_get_trade_raises_runtime_error_on_auth_failure(self) -> None:
+        fake_client = _FakeClient()
+        fake_client.raise_from_get_trades = RuntimeError("401 Unauthorized")
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        with self.assertRaises(RuntimeError):
+            adapter.get_trade("trade-2")
 
 
 if __name__ == "__main__":

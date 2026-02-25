@@ -4,6 +4,7 @@ import sys
 import unittest
 import csv
 from datetime import datetime, timezone
+from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ class _FakeLiveOpsAdapter:
         self._counter = 0
         self.open_order_ids: set[str] = set()
         self.canceled_order_ids: list[str] = []
+        self.place_requests: list[OrderRequest] = []
         self.cancel_all_calls = 0
         self.heartbeat_calls = 0
         self.heartbeat_ok = True
@@ -54,10 +56,12 @@ class _FakeLiveOpsAdapter:
         self.trade_payloads: dict[str, object] = {}
         self.get_order_calls: list[str] = []
         self.get_trade_calls: list[str] = []
+        self.raise_from_list_open_order_ids: list[Exception] = []
 
     def place_limit_order(self, request: OrderRequest) -> OrderHandle:
         self._counter += 1
         order_id = f"live-{self._counter}"
+        self.place_requests.append(request)
         self.open_order_ids.add(order_id)
         return OrderHandle(order_id=order_id, status=OrderStatus.OPEN, acknowledged_at=self._now)
 
@@ -68,6 +72,8 @@ class _FakeLiveOpsAdapter:
         return CancelResult(order_id=order_id, canceled=canceled, acknowledged_at=self._now)
 
     def list_open_order_ids(self) -> set[str]:
+        if self.raise_from_list_open_order_ids:
+            raise self.raise_from_list_open_order_ids.pop(0)
         return set(self.open_order_ids)
 
     def cancel_all_orders(self) -> int:
@@ -85,11 +91,17 @@ class _FakeLiveOpsAdapter:
 
     def get_order(self, order_id: str) -> object | None:
         self.get_order_calls.append(order_id)
-        return self.order_payloads.get(order_id)
+        payload = self.order_payloads.get(order_id)
+        if isinstance(payload, Exception):
+            raise payload
+        return payload
 
     def get_trade(self, trade_id: str) -> object | None:
         self.get_trade_calls.append(trade_id)
-        return self.trade_payloads.get(trade_id)
+        payload = self.trade_payloads.get(trade_id)
+        if isinstance(payload, Exception):
+            raise payload
+        return payload
 
 
 class AppRuntimeWiringTests(unittest.TestCase):
@@ -99,6 +111,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         mode: RuntimeMode,
         bankroll: float = 10_000.0,
         cancel_orphan_orders: bool = False,
+        enable_complete_set_arb: bool = False,
     ):
         with TemporaryDirectory() as tmp_dir:
             return build_config(
@@ -119,6 +132,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
                 log_dir=Path(tmp_dir),
                 enable_websocket=False,
                 cancel_orphan_orders=cancel_orphan_orders,
+                enable_complete_set_arb=enable_complete_set_arb,
                 polymarket_live_auth=PolymarketLiveAuthConfig(
                     private_key="0x1111111111111111111111111111111111111111111111111111111111111111",
                     funder="0x2222222222222222222222222222222222222222",
@@ -497,7 +511,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(engine.active_intents(), {})
         self.assertEqual(adapter.get_order_calls, ["live-100"])
         self.assertEqual(adapter.get_trade_calls, ["trade-77"])
-        self.assertEqual(engine._filled_entries_by_market.get("mkt-1"), 1)
+        self.assertIsNone(engine._filled_entries_by_market.get("mkt-1"))
 
         with config.logging.execution_csv_path.open("r", encoding="utf-8", newline="") as fp:
             rows = list(csv.DictReader(fp))
@@ -506,6 +520,103 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(live_fills[0]["side"], "up")
         self.assertEqual(float(live_fills[0]["size"]), 3.5)
         self.assertEqual(float(live_fills[0]["price"]), 0.53)
+
+    def test_reconcile_live_open_orders_tracks_partial_fill_progress_for_open_order(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 9, 0, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+
+        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id="live-100",
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.50,
+            size=10.0,
+            edge=0.03,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+        adapter.open_order_ids = {"live-100"}
+        adapter.order_payloads["live-100"] = {
+            "order": {
+                "id": "live-100",
+                "status": "LIVE",
+                "size_matched": "2.0",
+                "price": "0.50",
+            }
+        }
+
+        app._reconcile_live_open_orders(now=now, force=True)
+        with config.logging.execution_csv_path.open("r", encoding="utf-8", newline="") as fp:
+            rows = list(csv.DictReader(fp))
+        live_fills = [row for row in rows if row.get("status") == "live_fill" and row.get("order_id") == "live-100"]
+        self.assertEqual(len(live_fills), 1)
+        self.assertAlmostEqual(float(live_fills[0]["size"]), 2.0)
+        self.assertAlmostEqual(app._paper_result_tracker.unsettled_notional(), 1.0)
+
+        app._reconcile_live_open_orders(now=now, force=True)
+        with config.logging.execution_csv_path.open("r", encoding="utf-8", newline="") as fp:
+            rows = list(csv.DictReader(fp))
+        live_fills = [row for row in rows if row.get("status") == "live_fill" and row.get("order_id") == "live-100"]
+        self.assertEqual(len(live_fills), 1)
+
+        adapter.order_payloads["live-100"] = {
+            "order": {
+                "id": "live-100",
+                "status": "LIVE",
+                "size_matched": "3.0",
+                "price": "0.50",
+            }
+        }
+        app._reconcile_live_open_orders(now=now, force=True)
+        with config.logging.execution_csv_path.open("r", encoding="utf-8", newline="") as fp:
+            rows = list(csv.DictReader(fp))
+        live_fills = [row for row in rows if row.get("status") == "live_fill" and row.get("order_id") == "live-100"]
+        self.assertEqual(len(live_fills), 2)
+        self.assertAlmostEqual(float(live_fills[-1]["size"]), 3.0)
+        self.assertAlmostEqual(app._paper_result_tracker.unsettled_notional(), 1.5)
+
+    def test_reconcile_live_open_orders_retries_order_poll_then_latches_kill_switch(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 9, 30, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+        adapter.open_order_ids = {"live-100"}
+        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id="live-100",
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.50,
+            size=10.0,
+            edge=0.03,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+        adapter.order_payloads["live-100"] = RuntimeError("401 Unauthorized")
+
+        app._reconcile_live_open_orders(now=now, force=True)
+
+        self.assertTrue(app._external_kill_switch_latched)
+        self.assertTrue(engine.kill_switch.active)
+        self.assertEqual(adapter.cancel_all_calls, 1)
+        self.assertGreaterEqual(len(adapter.get_order_calls), 3)
 
     def test_heartbeat_failure_latches_emergency_and_cancels_all_live_orders(self) -> None:
         config = self._build_config(mode=RuntimeMode.LIVE)
@@ -527,6 +638,67 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(adapter.cancel_all_calls, 1)
         self.assertTrue(app._external_kill_switch_latched)
         self.assertTrue(engine.kill_switch.active)
+
+    def test_complete_set_one_leg_timeout_attempts_recovery_before_kill(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE, enable_complete_set_arb=True)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+        app._token_tick_sizes = {"tok-up": 0.01, "tok-down": 0.01}
+        app._arb_one_leg_started_at = now - timedelta(seconds=120)
+        app._apply_live_market_side_exposure(market_id="mkt-1", side=Side.BUY, delta_tokens=3.0)
+        engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id="live-100",
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.60,
+            size=3.0,
+            edge=0.03,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+        adapter.open_order_ids = {"live-100"}
+        up_quote = BestQuote(
+            token_id="tok-up",
+            best_bid=0.59,
+            best_ask=0.60,
+            updated_at=now,
+            source="test",
+        )
+        down_quote = BestQuote(
+            token_id="tok-down",
+            best_bid=0.40,
+            best_ask=0.41,
+            updated_at=now,
+            source="test",
+        )
+
+        app._guard_complete_set_partial_state(
+            now=now,
+            market_id="mkt-1",
+            seconds_to_expiry=600.0,
+            up_quote=up_quote,
+            down_quote=down_quote,
+            safety=SimpleNamespace(
+                fee_rate=0.0,
+                data_age_s=0.0,
+                clock_drift_s=0.0,
+                book_is_consistent=True,
+            ),
+        )
+
+        self.assertFalse(app._external_kill_switch_latched)
+        self.assertGreaterEqual(len(adapter.place_requests), 1)
+        self.assertEqual(adapter.place_requests[-1].token_id, "tok-down")
+        self.assertEqual(adapter.place_requests[-1].order_side.value, "BUY")
 
     def test_near_expiry_cleanup_cancels_existing_intents_once(self) -> None:
         config = self._build_config(mode=RuntimeMode.DRY_RUN)

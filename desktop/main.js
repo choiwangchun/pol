@@ -149,6 +149,9 @@ function buildBotCommand(config) {
   if (Number(config.maxTicks || 0) > 0) {
     args.push("--max-ticks", String(Number(config.maxTicks)));
   }
+  if (mode === "live") {
+    args.push("--hard-kill-on-daily-loss");
+  }
   if (config.freshStart) {
     args.push("--fresh-start");
   }

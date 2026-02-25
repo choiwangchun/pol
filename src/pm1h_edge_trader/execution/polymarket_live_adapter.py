@@ -196,8 +196,12 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
             return None
         try:
             payload = self._client.get_order(normalized)
-        except Exception:
-            return None
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return None
+            raise RuntimeError(
+                f"Polymarket get_order failed ({exc.__class__.__name__})."
+            ) from exc
         return payload if isinstance(payload, Mapping) else None
 
     def get_trade(self, trade_id: str) -> Mapping[str, Any] | None:
@@ -208,8 +212,12 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
         try:
             params = TradeParams(id=normalized)  # type: ignore[misc,operator]
             payload = self._client.get_trades(params=params)
-        except Exception:
-            return None
+        except Exception as exc:
+            if _is_not_found_error(exc):
+                return None
+            raise RuntimeError(
+                f"Polymarket get_trade failed ({exc.__class__.__name__})."
+            ) from exc
         trade = _find_trade_by_id(payload, normalized)
         if trade is not None:
             return trade
@@ -299,6 +307,16 @@ def _find_trade_by_id(payload: object, trade_id: str) -> Mapping[str, Any] | Non
             if found is not None:
                 return found
     return None
+
+
+def _is_not_found_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 404:
+        return True
+    text = str(exc).strip().lower()
+    if not text:
+        return False
+    return ("not found" in text) or ("status=404" in text) or ("404" in text and "unauthorized" not in text)
 
 
 def _extract_first_str_by_keys(payload: object, keys: Sequence[str]) -> str | None:

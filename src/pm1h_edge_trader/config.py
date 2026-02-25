@@ -154,7 +154,7 @@ class SafetyConfig:
     heartbeat_interval_seconds: float = 5.0
     open_order_reconcile_interval_seconds: float = 10.0
     cancel_orphan_orders: bool = False
-    hard_kill_on_daily_loss: bool = False
+    hard_kill_on_daily_loss: bool = True
     requote_interval_seconds: float = 15.0
     max_intent_age_seconds: float = 45.0
     kill_switch_latch: bool = True
@@ -248,7 +248,7 @@ def build_config(
     position_reconcile_interval_seconds: float = 10.0,
     position_mismatch_policy: str = "kill",
     position_size_threshold: float = 0.0001,
-    hard_kill_on_daily_loss: bool = False,
+    hard_kill_on_daily_loss: bool = True,
     enable_complete_set_arb: bool = False,
     arb_min_profit: float = 0.0,
     arb_max_notional: float = 25.0,

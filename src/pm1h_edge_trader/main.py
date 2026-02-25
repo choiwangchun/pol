@@ -53,6 +53,7 @@ from .strategy import CompleteSetArbDecision, decide_complete_set_arb
 
 LOGGER = logging.getLogger("pm1h_edge_trader")
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
+LIVE_RECON_MAX_RETRIES = 3
 
 
 def utc_now() -> datetime:
@@ -307,8 +308,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--hard-kill-on-daily-loss",
-        action="store_true",
-        help="Latch kill switch and cancel orders when daily loss cap is reached.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Latch kill switch and cancel orders when daily loss cap is reached (default: enabled).",
     )
     parser.add_argument(
         "--position-reconcile-interval-seconds",
@@ -698,6 +700,8 @@ class PM1HEdgeTraderApp:
         self._auto_claim_init_failed = False
         self._positions_client: DataApiPositionsClient | None = None
         self._arb_one_leg_started_at: datetime | None = None
+        self._live_order_matched_sizes: dict[str, float] = {}
+        self._live_market_side_exposure_tokens: dict[tuple[str, Side], float] = {}
 
         if config.mode == RuntimeMode.DRY_RUN:
             resolver = PolymarketMarketResolutionResolver(
@@ -875,6 +879,8 @@ class PM1HEdgeTraderApp:
         self._latest_policy_selection = None
         self._position_mismatch_blocked = False
         self._arb_one_leg_started_at = None
+        self._live_order_matched_sizes = {}
+        self._live_market_side_exposure_tokens = {}
         self._market = None
 
     async def _tick_once(self, *, tick_count: int) -> bool:
@@ -1056,7 +1062,14 @@ class PM1HEdgeTraderApp:
             all_actions.extend(result.actions)
         stale_result = self._execution_engine.sweep_stale_intents(now=now)
         all_actions.extend(stale_result.actions)
-        self._guard_complete_set_partial_state(now=now, market_id=market.market_id)
+        self._guard_complete_set_partial_state(
+            now=now,
+            market_id=market.market_id,
+            seconds_to_expiry=seconds_to_expiry,
+            up_quote=up_quote,
+            down_quote=down_quote,
+            safety=safety,
+        )
 
         signal_map = {
             Side.BUY: up_signal,
@@ -1241,7 +1254,16 @@ class PM1HEdgeTraderApp:
         interval = max(1.0, self._config.position_reconcile.interval_seconds)
         self._next_position_reconcile_check = now + timedelta(seconds=interval)
 
-    def _guard_complete_set_partial_state(self, *, now: datetime, market_id: str) -> None:
+    def _guard_complete_set_partial_state(
+        self,
+        *,
+        now: datetime,
+        market_id: str,
+        seconds_to_expiry: float,
+        up_quote: BestQuote | None,
+        down_quote: BestQuote | None,
+        safety: SafetySurface,
+    ) -> None:
         if not self._config.complete_set_arb.enabled:
             self._arb_one_leg_started_at = None
             return
@@ -1258,12 +1280,168 @@ class PM1HEdgeTraderApp:
         elapsed = (now - self._arb_one_leg_started_at).total_seconds()
         if elapsed < self._config.complete_set_arb.fill_timeout_seconds:
             return
+        recovered = self._attempt_complete_set_recovery(
+            now=now,
+            market_id=market_id,
+            seconds_to_expiry=seconds_to_expiry,
+            up_quote=up_quote,
+            down_quote=down_quote,
+            safety=safety,
+        )
+        if recovered:
+            self._arb_one_leg_started_at = now
+            return
         self._trigger_external_kill_switch(
             reason=KillSwitchReason.POSITION_MISMATCH,
             now=now,
             message="complete_set_one_leg_timeout",
         )
         self._arb_one_leg_started_at = now
+
+    def _attempt_complete_set_recovery(
+        self,
+        *,
+        now: datetime,
+        market_id: str,
+        seconds_to_expiry: float,
+        up_quote: BestQuote | None,
+        down_quote: BestQuote | None,
+        safety: SafetySurface,
+    ) -> bool:
+        if self._external_kill_switch_latched or self._execution_engine.kill_switch.active:
+            return False
+
+        try:
+            self._execution_engine.cancel_all_intents(reason="complete_set_recovery")
+        except Exception as exc:
+            LOGGER.warning("complete_set_recovery_cancel_failed error=%s", exc)
+
+        up_exposure = max(0.0, self._market_side_exposure_tokens(market_id, Side.BUY))
+        down_exposure = max(0.0, self._market_side_exposure_tokens(market_id, Side.SELL))
+        imbalance = up_exposure - down_exposure
+        if abs(imbalance) <= 1e-9:
+            LOGGER.warning("complete_set_recovery_skipped reason=no_detected_exposure")
+            return False
+
+        if imbalance > 0.0:
+            completion_ok = self._place_recovery_order(
+                now=now,
+                market_id=market_id,
+                side=Side.SELL,
+                token_id=down_quote.token_id if down_quote is not None else "",
+                order_side=VenueOrderSide.BUY,
+                quote_price=down_quote.best_ask if down_quote is not None else None,
+                size=imbalance,
+                seconds_to_expiry=seconds_to_expiry,
+                safety=safety,
+                reason="complete_set_recovery_complete_missing_down",
+            )
+            if completion_ok:
+                return True
+            unwind_ok = self._place_recovery_order(
+                now=now,
+                market_id=market_id,
+                side=Side.BUY,
+                token_id=up_quote.token_id if up_quote is not None else "",
+                order_side=VenueOrderSide.SELL,
+                quote_price=up_quote.best_bid if up_quote is not None else None,
+                size=imbalance,
+                seconds_to_expiry=seconds_to_expiry,
+                safety=safety,
+                reason="complete_set_recovery_unwind_up",
+            )
+            return unwind_ok
+
+        completion_ok = self._place_recovery_order(
+            now=now,
+            market_id=market_id,
+            side=Side.BUY,
+            token_id=up_quote.token_id if up_quote is not None else "",
+            order_side=VenueOrderSide.BUY,
+            quote_price=up_quote.best_ask if up_quote is not None else None,
+            size=abs(imbalance),
+            seconds_to_expiry=seconds_to_expiry,
+            safety=safety,
+            reason="complete_set_recovery_complete_missing_up",
+        )
+        if completion_ok:
+            return True
+        unwind_ok = self._place_recovery_order(
+            now=now,
+            market_id=market_id,
+            side=Side.SELL,
+            token_id=down_quote.token_id if down_quote is not None else "",
+            order_side=VenueOrderSide.SELL,
+            quote_price=down_quote.best_bid if down_quote is not None else None,
+            size=abs(imbalance),
+            seconds_to_expiry=seconds_to_expiry,
+            safety=safety,
+            reason="complete_set_recovery_unwind_down",
+        )
+        return unwind_ok
+
+    def _place_recovery_order(
+        self,
+        *,
+        now: datetime,
+        market_id: str,
+        side: Side,
+        token_id: str,
+        order_side: VenueOrderSide,
+        quote_price: float | None,
+        size: float,
+        seconds_to_expiry: float,
+        safety: SafetySurface,
+        reason: str,
+    ) -> bool:
+        normalized_token = str(token_id).strip()
+        if not normalized_token:
+            LOGGER.warning("%s skipped reason=missing_token_id", reason)
+            return False
+        if quote_price is None or quote_price <= 0.0:
+            LOGGER.warning("%s skipped reason=missing_price", reason)
+            return False
+        if size <= 0.0:
+            LOGGER.warning("%s skipped reason=non_positive_size", reason)
+            return False
+        tick_size = self._token_tick_sizes.get(normalized_token, 0.0001)
+        desired_price = _round_down_to_tick(quote_price, tick_size)
+        emergency_seconds_to_expiry = max(
+            seconds_to_expiry,
+            self._config.safety.entry_block_window_seconds + 1.0,
+        )
+        signal = IntentSignal(
+            market_id=market_id,
+            token_id=normalized_token,
+            side=side,
+            edge=1.0,
+            min_edge=-1.0,
+            desired_price=desired_price,
+            size=size,
+            seconds_to_expiry=emergency_seconds_to_expiry,
+            signal_ts=now,
+            allow_entry=True,
+            order_side=order_side,
+        )
+        try:
+            result = self._execution_engine.process_signal(signal, safety, now=now)
+        except Exception as exc:
+            LOGGER.warning("%s failed error=%s", reason, exc)
+            return False
+        placed = any(action.action_type == ExecutionActionType.PLACE for action in result.actions)
+        if placed:
+            LOGGER.warning(
+                "%s placed token=%s side=%s order_side=%s size=%.6f price=%.6f",
+                reason,
+                normalized_token,
+                side.value,
+                order_side.value,
+                size,
+                desired_price,
+            )
+            return True
+        LOGGER.warning("%s skipped reason=no_place_action", reason)
+        return False
 
     async def _refresh_fee_state(self, *, force: bool = False, now: datetime | None = None) -> None:
         market = self._require_market()
@@ -1664,9 +1842,8 @@ class PM1HEdgeTraderApp:
         if not force and self._next_open_order_reconcile_check is not None and now < self._next_open_order_reconcile_check:
             return
 
-        adapter = self._execution_engine._adapter
         try:
-            venue_open_ids = adapter.list_open_order_ids()
+            venue_open_ids = self._list_open_order_ids_with_retry()
         except Exception:
             self._trigger_external_kill_switch(
                 reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
@@ -1680,10 +1857,12 @@ class PM1HEdgeTraderApp:
         active_intents = self._execution_engine.active_intents()
         local_open_ids = {intent.order_id for intent in active_intents.values()}
         intent_by_order_id = {intent.order_id: intent for intent in active_intents.values()}
+        shared_open_ids = local_open_ids & venue_open_ids
         orphaned_ids = venue_open_ids - local_open_ids
         missing_ids = local_open_ids - venue_open_ids
 
         if orphaned_ids:
+            adapter = self._execution_engine._adapter
             if not self._config.safety.cancel_orphan_orders:
                 self._trigger_external_kill_switch(
                     reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
@@ -1711,22 +1890,64 @@ class PM1HEdgeTraderApp:
                     )
                     break
 
+        for order_id in shared_open_ids:
+            intent = intent_by_order_id.get(order_id)
+            if intent is None:
+                continue
+            try:
+                fill_snapshot = self._poll_live_fill_snapshot_with_retry(order_id=order_id, intent=intent)
+            except Exception:
+                self._trigger_external_kill_switch(
+                    reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                    now=now,
+                    message="Open-order fill polling failed",
+                )
+                interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
+                self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
+                return
+            if fill_snapshot is None:
+                continue
+            self._append_live_fill_record(
+                now=now,
+                order_id=order_id,
+                intent=intent,
+                fill_snapshot=fill_snapshot,
+            )
+            if fill_snapshot.matched_size >= max(0.0, intent.size) - 1e-9:
+                self._execution_engine.mark_order_filled(order_id)
+                self._live_order_matched_sizes.pop(order_id, None)
+
         for order_id in missing_ids:
             intent = intent_by_order_id.get(order_id)
             if intent is None:
                 self._execution_engine.drop_intent(order_id)
+                self._live_order_matched_sizes.pop(order_id, None)
                 continue
-            fill_snapshot = self._poll_live_fill_snapshot(order_id=order_id, intent=intent)
+            try:
+                fill_snapshot = self._poll_live_fill_snapshot_with_retry(order_id=order_id, intent=intent)
+            except Exception:
+                self._trigger_external_kill_switch(
+                    reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                    now=now,
+                    message="Missing-order fill polling failed",
+                )
+                interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
+                self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
+                return
             if fill_snapshot is not None:
-                self._execution_engine.mark_order_filled(order_id)
                 self._append_live_fill_record(
                     now=now,
                     order_id=order_id,
                     intent=intent,
                     fill_snapshot=fill_snapshot,
                 )
-                continue
-            self._execution_engine.drop_intent(order_id)
+                if fill_snapshot.matched_size >= max(0.0, intent.size) - 1e-9:
+                    self._execution_engine.mark_order_filled(order_id)
+                else:
+                    self._execution_engine.drop_intent(order_id)
+            else:
+                self._execution_engine.drop_intent(order_id)
+            self._live_order_matched_sizes.pop(order_id, None)
 
         if orphaned_ids or missing_ids:
             LOGGER.warning(
@@ -1738,6 +1959,36 @@ class PM1HEdgeTraderApp:
         interval = max(1.0, self._config.safety.open_order_reconcile_interval_seconds)
         self._next_open_order_reconcile_check = now + timedelta(seconds=interval)
 
+    def _list_open_order_ids_with_retry(self) -> set[str]:
+        adapter = self._execution_engine._adapter
+        last_error: Exception | None = None
+        for _ in range(max(1, LIVE_RECON_MAX_RETRIES)):
+            try:
+                return adapter.list_open_order_ids()
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return set()
+
+    def _poll_live_fill_snapshot_with_retry(
+        self,
+        *,
+        order_id: str,
+        intent: ActiveIntent,
+    ) -> LiveFillSnapshot | None:
+        last_error: Exception | None = None
+        for _ in range(max(1, LIVE_RECON_MAX_RETRIES)):
+            try:
+                return self._poll_live_fill_snapshot(order_id=order_id, intent=intent)
+            except Exception as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return None
+
     def _poll_live_fill_snapshot(self, *, order_id: str, intent: ActiveIntent) -> LiveFillSnapshot | None:
         if self._config.mode != RuntimeMode.LIVE:
             return None
@@ -1745,10 +1996,7 @@ class PM1HEdgeTraderApp:
         get_order = getattr(adapter, "get_order", None)
         if not callable(get_order):
             return None
-        try:
-            order_payload = get_order(order_id)
-        except Exception:
-            return None
+        order_payload = get_order(order_id)
         if not isinstance(order_payload, Mapping):
             return None
 
@@ -1828,6 +2076,16 @@ class PM1HEdgeTraderApp:
         intent: ActiveIntent,
         fill_snapshot: LiveFillSnapshot,
     ) -> None:
+        normalized_order_id = str(order_id).strip()
+        if not normalized_order_id:
+            return
+        bounded_matched = min(max(0.0, fill_snapshot.matched_size), max(0.0, intent.size))
+        previous_matched = self._live_order_matched_sizes.get(normalized_order_id, 0.0)
+        if bounded_matched <= previous_matched + 1e-12:
+            return
+        delta_size = bounded_matched - previous_matched
+        self._live_order_matched_sizes[normalized_order_id] = bounded_matched
+
         fill_price = fill_snapshot.price if fill_snapshot.price is not None and fill_snapshot.price > 0.0 else intent.price
         record = ExecutionLogRecord(
             timestamp=now,
@@ -1842,10 +2100,10 @@ class PM1HEdgeTraderApp:
             bid_down=0.0,
             ask_down=0.0,
             edge=intent.edge,
-            order_id=order_id,
+            order_id=normalized_order_id,
             side=_side_to_label(intent.side),
             price=fill_price,
-            size=fill_snapshot.matched_size,
+            size=bounded_matched,
             status="live_fill",
             settlement_outcome=None,
             pnl=None,
@@ -1853,6 +2111,12 @@ class PM1HEdgeTraderApp:
         self._reporter.append(record)
         if self._paper_result_tracker is not None:
             self._paper_result_tracker.on_record(record)
+        direction = 1.0 if intent.order_side == VenueOrderSide.BUY else -1.0
+        self._apply_live_market_side_exposure(
+            market_id=intent.market_id,
+            side=intent.side,
+            delta_tokens=delta_size * direction,
+        )
 
     def _enforce_near_expiry_cleanup(
         self,
@@ -1982,10 +2246,31 @@ class PM1HEdgeTraderApp:
     def _has_local_market_exposure(self, market_id: str) -> bool:
         if self._open_intent_notional_for_market(market_id) > 0.0:
             return True
+        if self._market_side_exposure_tokens(market_id, Side.BUY) > 0.0:
+            return True
+        if self._market_side_exposure_tokens(market_id, Side.SELL) > 0.0:
+            return True
         tracker = self._paper_result_tracker
         if tracker is None:
             return False
         return tracker.market_unsettled_notional(market_id) > 0.0
+
+    def _apply_live_market_side_exposure(self, *, market_id: str, side: Side, delta_tokens: float) -> None:
+        normalized_market_id = str(market_id).strip()
+        if not normalized_market_id:
+            return
+        key = (normalized_market_id, side)
+        next_value = self._live_market_side_exposure_tokens.get(key, 0.0) + float(delta_tokens)
+        if next_value <= 1e-12:
+            self._live_market_side_exposure_tokens.pop(key, None)
+            return
+        self._live_market_side_exposure_tokens[key] = next_value
+
+    def _market_side_exposure_tokens(self, market_id: str, side: Side) -> float:
+        normalized_market_id = str(market_id).strip()
+        if not normalized_market_id:
+            return 0.0
+        return max(0.0, self._live_market_side_exposure_tokens.get((normalized_market_id, side), 0.0))
 
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:

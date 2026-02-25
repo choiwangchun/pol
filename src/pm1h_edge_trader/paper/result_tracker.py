@@ -121,18 +121,30 @@ class PaperResultTracker:
         if status in self._fill_statuses:
             if not order_id or order_id == "-" or order_id in self._settled_order_ids:
                 return False
-            if order_id in self._unsettled_fills:
-                return False
             market_id = str(record.market_id or "").strip()
             if not market_id:
                 return False
             notional = max(0.0, float(record.price) * float(record.size))
+            previous_notional = self._unsettled_fills.get(order_id)
+            existing_market_id = self._order_market_ids.get(order_id, market_id)
+            if previous_notional is None:
+                self._unsettled_fills[order_id] = notional
+                self._order_market_ids[order_id] = existing_market_id
+                self._unsettled_notional_by_market[existing_market_id] = (
+                    self._unsettled_notional_by_market.get(existing_market_id, 0.0) + notional
+                )
+                self._market_entry_counts[existing_market_id] = self._market_entry_counts.get(existing_market_id, 0) + 1
+                return True
+
+            if notional <= previous_notional + 1e-12:
+                return False
+
+            delta = notional - previous_notional
             self._unsettled_fills[order_id] = notional
-            self._order_market_ids[order_id] = market_id
-            self._unsettled_notional_by_market[market_id] = (
-                self._unsettled_notional_by_market.get(market_id, 0.0) + notional
+            self._order_market_ids[order_id] = existing_market_id
+            self._unsettled_notional_by_market[existing_market_id] = (
+                self._unsettled_notional_by_market.get(existing_market_id, 0.0) + delta
             )
-            self._market_entry_counts[market_id] = self._market_entry_counts.get(market_id, 0) + 1
             return True
 
         if status in self._settle_statuses:

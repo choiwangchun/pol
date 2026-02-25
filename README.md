@@ -76,7 +76,7 @@ Live 모드에서는 자동 Claim(온체인 `redeemPositions`) 루프가 기본 
 Safety + Recon + Arb 옵션(기본은 안전/옵트인):
 
 ```bash
---hard-kill-on-daily-loss
+--hard-kill-on-daily-loss         # 기본 ON (비활성화: --no-hard-kill-on-daily-loss)
 --position-reconcile-interval-seconds 10
 --position-mismatch-policy kill   # kill | block | warn
 --position-size-threshold 0.0001
@@ -99,6 +99,9 @@ Live 오더 리컨실 정책(기본값 안전 모드):
 Live 체결 집계:
 
 - `live_fill` 이벤트를 `result.json`에 반영하여 `unsettled_notional`/`available_bankroll` 계산에 사용
+- open 상태 주문도 `size_matched` 증가분을 주기적으로 폴링하여 partial fill을 누적 반영
+- `get_orders`/`get_order` 실패는 재시도 후 fail-safe kill-switch를 트리거
+- complete-set 원레그 타임아웃 시 우선 자동 복구(반대편 보강 또는 언와인드 시도) 후 실패 시 kill-switch
 - 현재 전략은 UP/DOWN 토큰을 기본적으로 `BUY`로 진입하며, 주문 객체에는 venue side(`BUY/SELL`)를 명시적으로 분리해 전달
 
 기존 `executions.csv`/`result.json` 누적 상태를 무시하고 새로 시작하려면:

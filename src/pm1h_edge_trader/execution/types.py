@@ -108,6 +108,7 @@ class ActiveIntent:
     edge: float
     created_at: datetime
     last_quoted_at: datetime
+    order_side: VenueOrderSide = VenueOrderSide.BUY
     status: OrderStatus = OrderStatus.OPEN
 
 

@@ -301,6 +301,7 @@ class LimitOrderExecutionEngine:
             edge=signal.edge,
             created_at=now,
             last_quoted_at=now,
+            order_side=signal.order_side,
             status=OrderStatus.OPEN,
         )
         return [

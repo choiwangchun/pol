@@ -173,6 +173,28 @@ class PaperResultTrackerTests(unittest.TestCase):
             self.assertAlmostEqual(tracker.current_balance(), 102.5)
             self.assertAlmostEqual(tracker.unsettled_notional(), 0.0)
 
+    def test_incremental_fill_updates_same_order_notional_monotonically(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            result_path = Path(tmp_dir) / "result.json"
+            tracker = PaperResultTracker(
+                initial_bankroll=100.0,
+                result_json_path=result_path,
+                fill_statuses=("live_fill",),
+                settle_statuses=("live_settle",),
+            )
+            tracker.write_snapshot()
+
+            tracker.on_record(_record(status="live_fill", order_id="live-1", price=0.4, size=2.0))
+            self.assertAlmostEqual(tracker.unsettled_notional(), 0.8)
+            self.assertEqual(tracker.market_entry_count("m1"), 1)
+
+            tracker.on_record(_record(status="live_fill", order_id="live-1", price=0.4, size=3.0))
+            self.assertAlmostEqual(tracker.unsettled_notional(), 1.2)
+            self.assertEqual(tracker.market_entry_count("m1"), 1)
+
+            tracker.on_record(_record(status="live_fill", order_id="live-1", price=0.4, size=3.0))
+            self.assertAlmostEqual(tracker.unsettled_notional(), 1.2)
+
 
 if __name__ == "__main__":
     unittest.main()

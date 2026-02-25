@@ -155,6 +155,9 @@ function collectStartConfig() {
   if (config.maxTicks > 0) {
     parts.push(`--max-ticks ${config.maxTicks}`);
   }
+  if (config.mode === "live") {
+    parts.push("--hard-kill-on-daily-loss");
+  }
   if (config.freshStart) {
     parts.push("--fresh-start");
   }
