@@ -231,11 +231,11 @@ function parseExecutionsCsv(filePath) {
     if (!orderId || orderId === "-") {
       return;
     }
-    if (status === "paper_fill") {
+    if (status === "paper_fill" || status === "live_fill") {
       unsettled.set(orderId, row);
       return;
     }
-    if (status === "paper_settle") {
+    if (status === "paper_settle" || status === "live_settle") {
       unsettled.delete(orderId);
     }
   });

@@ -11,7 +11,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from pm1h_edge_trader.config import PolymarketLiveAuthConfig  # noqa: E402
-from pm1h_edge_trader.execution import OrderRequest, Side  # noqa: E402
+from pm1h_edge_trader.execution import OrderRequest, Side, VenueOrderSide  # noqa: E402
 from pm1h_edge_trader.execution.polymarket_live_adapter import (  # noqa: E402
     PolymarketLiveExecutionAdapter,
 )
@@ -43,6 +43,8 @@ class _FakeClient:
         self.balance_allowance_response: object = {"balance": "123.45", "allowance": "120.0"}
         self.get_order_response: object = {"order": {"id": "oid-1", "status": "LIVE"}}
         self.get_trades_response: object = [{"id": "trade-1", "price": "0.51"}]
+        self.conditional_address_response: object = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+        self.collateral_address_response: object = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         self.raise_from_create: Exception | None = None
         self.raise_from_post: Exception | None = None
         self.raise_from_cancel: Exception | None = None
@@ -120,6 +122,12 @@ class _FakeClient:
         self.get_trades_calls.append(params)
         return self.get_trades_response
 
+    def get_conditional_address(self) -> object:
+        return self.conditional_address_response
+
+    def get_collateral_address(self) -> object:
+        return self.collateral_address_response
+
 
 class _PolyLikeApiError(Exception):
     def __init__(self, *, status_code: int, error_msg) -> None:  # type: ignore[no-untyped-def]
@@ -153,11 +161,12 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         )
         return adapter, kwargs_holder
 
-    def _request(self) -> OrderRequest:
+    def _request(self, *, order_side: VenueOrderSide = VenueOrderSide.BUY) -> OrderRequest:
         return OrderRequest(
             market_id="market-1",
             token_id="token-down",
             side=Side.SELL,
+            order_side=order_side,
             price=0.47,
             size=21.0,
             submitted_at=datetime(2026, 2, 16, tzinfo=timezone.utc),
@@ -182,6 +191,16 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         self.assertEqual(order_args.size, 21.0)
         self.assertEqual(order_args.side, "BUY")
         self.assertEqual(handle.order_id, "oid-1")
+
+    def test_place_limit_order_honors_explicit_sell_order_side(self) -> None:
+        fake_client = _FakeClient()
+        adapter, _ = self._adapter(fake_client=fake_client)
+
+        adapter.place_limit_order(self._request(order_side=VenueOrderSide.SELL))
+
+        self.assertEqual(len(fake_client.create_order_calls), 1)
+        order_args = fake_client.create_order_calls[0]
+        self.assertEqual(order_args.side, "SELL")
 
     def test_place_limit_order_reads_order_id_variants(self) -> None:
         responses = [
@@ -298,6 +317,18 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
 
         self.assertEqual(tick_size, 0.001)
         self.assertEqual(fake_client.get_tick_size_calls, ["token-up"])
+
+    def test_get_conditional_address_reads_hex_address(self) -> None:
+        fake_client = _FakeClient()
+        adapter, _ = self._adapter(fake_client=fake_client)
+        address = adapter.get_conditional_address()
+        self.assertEqual(address, "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+
+    def test_get_collateral_address_reads_hex_address(self) -> None:
+        fake_client = _FakeClient()
+        adapter, _ = self._adapter(fake_client=fake_client)
+        address = adapter.get_collateral_address()
+        self.assertEqual(address, "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
 
     def test_get_collateral_balance_allowance_reads_balance_and_allowance(self) -> None:
         fake_client = _FakeClient()

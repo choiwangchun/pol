@@ -36,12 +36,14 @@ from .execution import (
     PolymarketLiveExecutionAdapter,
     SafetySurface,
     Side,
+    VenueOrderSide,
 )
 from .feeds import BinanceUnderlyingAdapter, ClobOrderbookAdapter
 from .feeds.http_client import AsyncJsonHttpClient
 from .feeds.models import BestQuote, UnderlyingSnapshot
 from .logger import CSVExecutionReporter, ExecutionLogRecord
 from .live_balance import LiveBalanceSnapshot, fetch_live_balance_snapshot
+from .live_claim import LiveAutoClaimWorker, build_live_auto_claim_worker
 from .markets import FeeRateGuardClient, GammaMarketDiscoveryClient, MarketCandidate
 from .paper import PaperResultTracker, PaperSettlementCoordinator, PolymarketMarketResolutionResolver
 from .policy import PolicyBanditConfig, PolicyBanditController, PolicySelection
@@ -116,13 +118,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-market-notional",
         type=float,
         default=None,
-        help="Hard cap for unsettled notional in a single market. Default: 25% of bankroll.",
+        help="Hard cap for unsettled notional in a single market. Default: 25%% of bankroll.",
     )
     parser.add_argument(
         "--max-daily-loss",
         type=float,
         default=None,
-        help="Hard cap for realized daily loss. Default: 20% of bankroll.",
+        help="Hard cap for realized daily loss. Default: 20%% of bankroll.",
     )
     parser.add_argument(
         "--max-entries-per-market",
@@ -252,9 +254,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Max spread considered tight for context bucketing.",
     )
     parser.add_argument(
+        "--disable-auto-claim",
+        action="store_true",
+        help="Disable automatic on-chain redeem (claim) of resolved winning positions in live mode.",
+    )
+    parser.add_argument(
+        "--auto-claim-interval-seconds",
+        type=float,
+        default=60.0,
+        help="Polling interval for live auto-claim loop.",
+    )
+    parser.add_argument(
+        "--auto-claim-size-threshold",
+        type=float,
+        default=0.0001,
+        help="Minimum position size to include in auto-claim lookup.",
+    )
+    parser.add_argument(
+        "--auto-claim-cooldown-seconds",
+        type=float,
+        default=600.0,
+        help="Cooldown per condition between auto-claim attempts.",
+    )
+    parser.add_argument(
+        "--auto-claim-tx-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Timeout for on-chain claim transaction receipt.",
+    )
+    parser.add_argument(
+        "--polygon-rpc-url",
+        default=None,
+        help="Polygon RPC URL for auto-claim transaction submission.",
+    )
+    parser.add_argument(
+        "--data-api-base-url",
+        default="https://data-api.polymarket.com",
+        help="Polymarket data API base URL used for redeemable position lookup.",
+    )
+    parser.add_argument(
         "--disable-websocket",
         action="store_true",
         help="Disable websocket and use REST polling only.",
+    )
+    parser.add_argument(
+        "--cancel-orphan-orders",
+        action="store_true",
+        help="Allow automatic cancellation of venue open orders unknown to the local runtime.",
     )
     parser.add_argument(
         "--log-dir",
@@ -596,6 +642,9 @@ class PM1HEdgeTraderApp:
         self._next_heartbeat_check: datetime | None = None
         self._next_open_order_reconcile_check: datetime | None = None
         self._external_kill_switch_latched = False
+        self._live_auto_claim_worker: LiveAutoClaimWorker | None = None
+        self._next_auto_claim_check: datetime | None = None
+        self._auto_claim_init_failed = False
 
         if config.mode == RuntimeMode.DRY_RUN:
             resolver = PolymarketMarketResolutionResolver(
@@ -610,6 +659,13 @@ class PM1HEdgeTraderApp:
             self._paper_result_tracker = PaperResultTracker(
                 initial_bankroll=config.risk.bankroll,
                 result_json_path=config.logging.root_dir / "result.json",
+            )
+        elif config.mode == RuntimeMode.LIVE:
+            self._paper_result_tracker = PaperResultTracker(
+                initial_bankroll=config.risk.bankroll,
+                result_json_path=config.logging.root_dir / "result.json",
+                fill_statuses=("live_fill",),
+                settle_statuses=("live_settle",),
             )
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -717,6 +773,7 @@ class PM1HEdgeTraderApp:
         self._set_market_tick_sizes(self._discover_market_tick_sizes(market))
         self._next_heartbeat_check = now_ts
         self._next_open_order_reconcile_check = now_ts
+        self._next_auto_claim_check = now_ts
         await self._refresh_fee_state(force=True, now=now_ts)
         await self._reconcile_paper_settlements(force=True, now=now_ts)
         LOGGER.info(
@@ -736,6 +793,12 @@ class PM1HEdgeTraderApp:
         await self._deactivate_market()
 
     async def _deactivate_market(self) -> None:
+        if self._config.mode == RuntimeMode.LIVE:
+            try:
+                self._execution_engine.cancel_all_intents(reason="shutdown")
+            except Exception as exc:
+                LOGGER.warning("shutdown_local_cancel_failed: %s", exc)
+
         tasks: list[asyncio.Future[object]] = []
         if self._orderbook is not None:
             tasks.append(asyncio.ensure_future(self._orderbook.stop()))
@@ -750,6 +813,7 @@ class PM1HEdgeTraderApp:
         self._near_expiry_cleanup_done = False
         self._next_heartbeat_check = None
         self._next_open_order_reconcile_check = None
+        self._next_auto_claim_check = None
         self._latest_policy_selection = None
         self._market = None
 
@@ -761,6 +825,7 @@ class PM1HEdgeTraderApp:
 
         self._run_live_heartbeat(now=now)
         self._reconcile_live_open_orders(now=now)
+        self._run_live_auto_claim(now=now)
 
         await self._refresh_fee_state(now=now)
         max_fee_rate = self._fee_state.max_fee_rate if self._fee_state is not None else 0.0
@@ -903,6 +968,87 @@ class PM1HEdgeTraderApp:
         await self._reconcile_paper_settlements(now=now)
         return False
 
+    def _ensure_live_auto_claim_worker(self) -> LiveAutoClaimWorker | None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return None
+        if not self._config.auto_claim.enabled:
+            return None
+        if self._auto_claim_init_failed:
+            return None
+        if self._live_auto_claim_worker is not None:
+            return self._live_auto_claim_worker
+
+        adapter = self._execution_engine._adapter
+        if not isinstance(adapter, PolymarketLiveExecutionAdapter):
+            self._auto_claim_init_failed = True
+            LOGGER.warning("auto_claim_disabled reason=live_adapter_unavailable")
+            return None
+        try:
+            self._live_auto_claim_worker = build_live_auto_claim_worker(
+                auth=self._config.polymarket_live_auth,
+                adapter=adapter,
+                rpc_url=self._config.auto_claim.polygon_rpc_url,
+                data_api_base_url=self._config.auto_claim.data_api_base_url,
+                size_threshold=self._config.auto_claim.size_threshold,
+                cooldown_seconds=self._config.auto_claim.cooldown_seconds,
+                tx_timeout_seconds=self._config.auto_claim.tx_timeout_seconds,
+            )
+        except Exception as exc:
+            self._auto_claim_init_failed = True
+            LOGGER.warning("auto_claim_disabled reason=%s", exc)
+            return None
+        return self._live_auto_claim_worker
+
+    def _run_live_auto_claim(self, *, now: datetime, force: bool = False) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        worker = self._ensure_live_auto_claim_worker()
+        if worker is None:
+            return
+        if not force and self._next_auto_claim_check is not None and now < self._next_auto_claim_check:
+            return
+
+        try:
+            summary = worker.run_once()
+        except Exception as exc:
+            LOGGER.warning("auto_claim_loop_failed error=%s", exc)
+            interval = max(5.0, self._config.auto_claim.interval_seconds)
+            self._next_auto_claim_check = now + timedelta(seconds=interval)
+            return
+
+        if summary.targets > 0 or summary.attempted > 0:
+            LOGGER.info(
+                (
+                    "auto_claim_scan checked_positions=%s targets=%s attempted=%s "
+                    "claimed=%s errors=%s skipped_cooldown=%s"
+                ),
+                summary.checked_positions,
+                summary.targets,
+                summary.attempted,
+                summary.claimed,
+                summary.errors,
+                summary.skipped_cooldown,
+            )
+        for attempt in summary.attempts:
+            if attempt.success:
+                LOGGER.info(
+                    "auto_claim_success condition_id=%s index_sets=%s tx_hash=%s",
+                    attempt.condition_id,
+                    ",".join(str(item) for item in attempt.index_sets),
+                    attempt.tx_hash,
+                )
+                continue
+            LOGGER.warning(
+                "auto_claim_failed condition_id=%s index_sets=%s tx_hash=%s error=%s",
+                attempt.condition_id,
+                ",".join(str(item) for item in attempt.index_sets),
+                attempt.tx_hash,
+                attempt.error,
+            )
+
+        interval = max(5.0, self._config.auto_claim.interval_seconds)
+        self._next_auto_claim_check = now + timedelta(seconds=interval)
+
     async def _refresh_fee_state(self, *, force: bool = False, now: datetime | None = None) -> None:
         market = self._require_market()
         now_ts = now or utc_now()
@@ -948,6 +1094,7 @@ class PM1HEdgeTraderApp:
                 seconds_to_expiry=max(seconds_to_expiry, 0.0),
                 signal_ts=now,
                 allow_entry=allow_entry,
+                order_side=VenueOrderSide.BUY,
             )
 
         side_intent = decision.up if side_label == "up" else decision.down
@@ -981,6 +1128,7 @@ class PM1HEdgeTraderApp:
             seconds_to_expiry=max(seconds_to_expiry, 0.0),
             signal_ts=now,
             allow_entry=allow_entry,
+            order_side=VenueOrderSide.BUY,
         )
 
     def _report_action(
@@ -1019,6 +1167,8 @@ class PM1HEdgeTraderApp:
             pnl=None,
         )
         self._reporter.append(record)
+        if self._paper_result_tracker is not None:
+            self._paper_result_tracker.on_record(record)
         if self._paper_result_tracker is not None:
             self._paper_result_tracker.on_record(record)
 
@@ -1248,24 +1398,33 @@ class PM1HEdgeTraderApp:
         orphaned_ids = venue_open_ids - local_open_ids
         missing_ids = local_open_ids - venue_open_ids
 
-        for order_id in orphaned_ids:
-            try:
-                result = adapter.cancel_order(order_id)
-            except Exception:
+        if orphaned_ids:
+            if not self._config.safety.cancel_orphan_orders:
                 self._trigger_external_kill_switch(
                     reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
                     now=now,
-                    message="Failed to cancel orphaned open order",
+                    message="Found orphaned open order(s); manual review required",
+                    cancel_venue_orders=False,
                 )
-                break
-            if result.canceled:
-                continue
-            self._trigger_external_kill_switch(
-                reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
-                now=now,
-                message="Found orphaned open order that could not be canceled",
-            )
-            break
+            else:
+                for order_id in orphaned_ids:
+                    try:
+                        result = adapter.cancel_order(order_id)
+                    except Exception:
+                        self._trigger_external_kill_switch(
+                            reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                            now=now,
+                            message="Failed to cancel orphaned open order",
+                        )
+                        break
+                    if result.canceled:
+                        continue
+                    self._trigger_external_kill_switch(
+                        reason=KillSwitchReason.ORDER_RECONCILIATION_FAILED,
+                        now=now,
+                        message="Found orphaned open order that could not be canceled",
+                    )
+                    break
 
         for order_id in missing_ids:
             intent = intent_by_order_id.get(order_id)
@@ -1451,6 +1610,7 @@ class PM1HEdgeTraderApp:
         reason: KillSwitchReason,
         now: datetime,
         message: str,
+        cancel_venue_orders: bool = True,
     ) -> None:
         if self._external_kill_switch_latched:
             return
@@ -1459,14 +1619,14 @@ class PM1HEdgeTraderApp:
             self._execution_engine.latch_kill_switch(reason=reason, now=now)
         except Exception as exc:
             LOGGER.warning("kill_switch_latch_local_cancel_failed: %s", exc)
-        self._cancel_all_venue_orders(now=now)
+        if cancel_venue_orders:
+            self._cancel_all_venue_orders(now=now)
         LOGGER.error("%s: kill switch latched.", message)
 
     def _decision_bankroll(self) -> float:
         tracker = self._paper_result_tracker
-        if tracker is None:
-            return self._config.risk.bankroll
-        return tracker.available_bankroll()
+        base = tracker.available_bankroll() if tracker is not None else self._config.risk.bankroll
+        return max(0.0, base - self._open_intent_notional_total())
 
     def _entry_block_reason(self, *, now: datetime, market_id: str) -> str | None:
         if self._external_kill_switch_latched:
@@ -1495,8 +1655,22 @@ class PM1HEdgeTraderApp:
             return capped
         tracker = self._paper_result_tracker
         used_notional = tracker.market_unsettled_notional(market_id) if tracker is not None else 0.0
+        used_notional += self._open_intent_notional_for_market(market_id)
         remaining = max(0.0, market_cap - used_notional)
         return min(capped, remaining)
+
+    def _open_intent_notional_total(self) -> float:
+        return sum(max(0.0, intent.price * intent.size) for intent in self._execution_engine.active_intents().values())
+
+    def _open_intent_notional_for_market(self, market_id: str) -> float:
+        normalized_market_id = str(market_id).strip()
+        if not normalized_market_id:
+            return 0.0
+        return sum(
+            max(0.0, intent.price * intent.size)
+            for intent in self._execution_engine.active_intents().values()
+            if intent.market_id == normalized_market_id
+        )
 
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -1568,6 +1742,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         policy_reward_risk_penalty=args.policy_reward_risk_penalty,
         policy_vol_ratio_threshold=args.policy_vol_ratio_threshold,
         policy_spread_tight_threshold=args.policy_spread_tight_threshold,
+        enable_auto_claim=not args.disable_auto_claim,
+        auto_claim_interval_seconds=args.auto_claim_interval_seconds,
+        auto_claim_size_threshold=args.auto_claim_size_threshold,
+        auto_claim_cooldown_seconds=args.auto_claim_cooldown_seconds,
+        auto_claim_tx_timeout_seconds=args.auto_claim_tx_timeout_seconds,
+        polygon_rpc_url=args.polygon_rpc_url,
+        data_api_base_url=args.data_api_base_url,
+        cancel_orphan_orders=args.cancel_orphan_orders,
         log_dir=args.log_dir,
         enable_websocket=not args.disable_websocket,
         fresh_start=args.fresh_start,

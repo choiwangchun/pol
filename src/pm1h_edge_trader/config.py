@@ -98,6 +98,17 @@ class PolicyConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class AutoClaimConfig:
+    enabled: bool = True
+    interval_seconds: float = 60.0
+    size_threshold: float = 0.0001
+    cooldown_seconds: float = 600.0
+    tx_timeout_seconds: float = 120.0
+    polygon_rpc_url: str = "https://polygon-rpc.com"
+    data_api_base_url: str = "https://data-api.polymarket.com"
+
+
+@dataclass(slots=True, frozen=True)
 class RiskConfig:
     bankroll: float = 10_000.0
     kelly_fraction: float = 0.25
@@ -126,6 +137,7 @@ class SafetyConfig:
     entry_block_window_seconds: float = 60.0
     heartbeat_interval_seconds: float = 5.0
     open_order_reconcile_interval_seconds: float = 10.0
+    cancel_orphan_orders: bool = False
     requote_interval_seconds: float = 15.0
     max_intent_age_seconds: float = 45.0
     kill_switch_latch: bool = True
@@ -156,6 +168,7 @@ class AppConfig:
     volatility: VolatilityConfig = field(default_factory=VolatilityConfig)
     decision: DecisionConfig = field(default_factory=DecisionConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    auto_claim: AutoClaimConfig = field(default_factory=AutoClaimConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     loop: LoopConfig = field(default_factory=LoopConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -206,6 +219,14 @@ def build_config(
     policy_reward_risk_penalty: float | None = None,
     policy_vol_ratio_threshold: float | None = None,
     policy_spread_tight_threshold: float | None = None,
+    enable_auto_claim: bool = True,
+    auto_claim_interval_seconds: float = 60.0,
+    auto_claim_size_threshold: float = 0.0001,
+    auto_claim_cooldown_seconds: float = 600.0,
+    auto_claim_tx_timeout_seconds: float = 120.0,
+    polygon_rpc_url: str | None = None,
+    data_api_base_url: str = "https://data-api.polymarket.com",
+    cancel_orphan_orders: bool = False,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
 ) -> AppConfig:
@@ -255,6 +276,15 @@ def build_config(
             vol_ratio_threshold=max(1.0, policy_vol_ratio_threshold or 1.1),
             spread_tight_threshold=max(0.0, policy_spread_tight_threshold or 0.03),
         ),
+        auto_claim=AutoClaimConfig(
+            enabled=enable_auto_claim,
+            interval_seconds=max(5.0, auto_claim_interval_seconds),
+            size_threshold=max(0.0, auto_claim_size_threshold),
+            cooldown_seconds=max(0.0, auto_claim_cooldown_seconds),
+            tx_timeout_seconds=max(10.0, auto_claim_tx_timeout_seconds),
+            polygon_rpc_url=(polygon_rpc_url or os.getenv("POLYGON_RPC_URL") or "https://polygon-rpc.com"),
+            data_api_base_url=data_api_base_url.strip() or "https://data-api.polymarket.com",
+        ),
         risk=RiskConfig(
             bankroll=bankroll,
             kelly_fraction=kelly_fraction,
@@ -269,6 +299,7 @@ def build_config(
             max_ticks=max_ticks,
             enable_websocket=enable_websocket,
         ),
+        safety=SafetyConfig(cancel_orphan_orders=cancel_orphan_orders),
         logging=LoggingConfig(root_dir=log_dir),
     )
 

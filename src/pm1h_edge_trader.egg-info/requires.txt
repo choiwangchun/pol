@@ -1,1 +1,2 @@
 py-clob-client
+web3<8,>=6

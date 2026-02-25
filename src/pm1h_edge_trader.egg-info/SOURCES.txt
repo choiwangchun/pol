@@ -5,6 +5,7 @@ src/pm1h_edge_trader/__init__.py
 src/pm1h_edge_trader/api_credentials.py
 src/pm1h_edge_trader/config.py
 src/pm1h_edge_trader/live_balance.py
+src/pm1h_edge_trader/live_claim.py
 src/pm1h_edge_trader/main.py
 src/pm1h_edge_trader/manual_entry.py
 src/pm1h_edge_trader/types.py
@@ -49,6 +50,7 @@ tests/test_app_runtime_wiring.py
 tests/test_execution_engine_token_id.py
 tests/test_fresh_start.py
 tests/test_live_balance.py
+tests/test_live_claim.py
 tests/test_live_mode_config.py
 tests/test_market_rollover.py
 tests/test_paper_fill_logic.py

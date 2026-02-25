@@ -6,6 +6,7 @@ Requires-Python: >=3.11
 Description-Content-Type: text/markdown
 License-File: LICENSE
 Requires-Dist: py-clob-client
+Requires-Dist: web3<8,>=6
 Dynamic: license-file
 
 # PM-1H Edge Trader (MVP)

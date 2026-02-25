@@ -22,10 +22,15 @@ class PaperResultTracker:
         initial_bankroll: float,
         result_json_path: str | Path,
         now_fn=utc_now,
+        fill_statuses: tuple[str, ...] = ("paper_fill",),
+        settle_statuses: tuple[str, ...] = ("paper_settle",),
     ) -> None:
         self._initial_bankroll = max(0.0, float(initial_bankroll))
         self._result_json_path = Path(result_json_path)
         self._now_fn = now_fn
+        self._fill_statuses = _normalize_status_set(fill_statuses, fallback=("paper_fill",))
+        self._settle_statuses = _normalize_status_set(settle_statuses, fallback=("paper_settle",))
+        self._tracked_statuses = self._fill_statuses | self._settle_statuses
         self._reset_state()
 
     def bootstrap_from_csv(self, csv_path: str | Path) -> None:
@@ -36,7 +41,7 @@ class PaperResultTracker:
             return
         with path.open("r", newline="", encoding="utf-8") as fp:
             rows = list(csv.DictReader(fp))
-        for record in _records_from_rows(rows):
+        for record in _records_from_rows(rows, allowed_statuses=self._tracked_statuses):
             self._apply_record(record)
         self.write_snapshot()
 
@@ -113,7 +118,7 @@ class PaperResultTracker:
         status = _normalize_status(record.status)
         order_id = (record.order_id or "").strip()
 
-        if status == "paper_fill":
+        if status in self._fill_statuses:
             if not order_id or order_id == "-" or order_id in self._settled_order_ids:
                 return False
             if order_id in self._unsettled_fills:
@@ -130,7 +135,7 @@ class PaperResultTracker:
             self._market_entry_counts[market_id] = self._market_entry_counts.get(market_id, 0) + 1
             return True
 
-        if status == "paper_settle":
+        if status in self._settle_statuses:
             if not order_id or order_id == "-" or order_id in self._settled_order_ids:
                 return False
             self._settled_order_ids.add(order_id)
@@ -164,11 +169,15 @@ class PaperResultTracker:
         return False
 
 
-def _records_from_rows(rows: Iterable[dict[str, str]]) -> list[ExecutionLogRecord]:
+def _records_from_rows(
+    rows: Iterable[dict[str, str]],
+    *,
+    allowed_statuses: set[str],
+) -> list[ExecutionLogRecord]:
     parsed: list[ExecutionLogRecord] = []
     for row in rows:
         status = _normalize_status(row.get("status"))
-        if status not in {"paper_fill", "paper_settle"}:
+        if status not in allowed_statuses:
             continue
         timestamp = _parse_datetime(row.get("timestamp")) or utc_now()
         record = ExecutionLogRecord(
@@ -194,6 +203,13 @@ def _records_from_rows(rows: Iterable[dict[str, str]]) -> list[ExecutionLogRecor
         )
         parsed.append(record)
     return parsed
+
+
+def _normalize_status_set(values: Iterable[str], *, fallback: tuple[str, ...]) -> set[str]:
+    normalized = {_normalize_status(item) for item in values if _normalize_status(item)}
+    if normalized:
+        return normalized
+    return {_normalize_status(item) for item in fallback if _normalize_status(item)}
 
 
 def _normalize_status(value: object) -> str:

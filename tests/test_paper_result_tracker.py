@@ -145,6 +145,34 @@ class PaperResultTrackerTests(unittest.TestCase):
             self.assertEqual(snapshot["realized_pnl"], 1.0)
             self.assertEqual(snapshot["current_balance"], 1001.0)
 
+    def test_supports_live_fill_and_live_settle_statuses(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            result_path = Path(tmp_dir) / "result.json"
+            tracker = PaperResultTracker(
+                initial_bankroll=100.0,
+                result_json_path=result_path,
+                fill_statuses=("live_fill",),
+                settle_statuses=("live_settle",),
+            )
+            tracker.write_snapshot()
+
+            tracker.on_record(_record(status="live_fill", order_id="live-1", price=0.4, size=10.0))
+            self.assertAlmostEqual(tracker.unsettled_notional(), 4.0)
+            self.assertAlmostEqual(tracker.available_bankroll(), 96.0)
+
+            tracker.on_record(
+                _record(
+                    status="live_settle",
+                    order_id="live-1",
+                    price=0.4,
+                    size=10.0,
+                    pnl=2.5,
+                    settlement_outcome="win",
+                )
+            )
+            self.assertAlmostEqual(tracker.current_balance(), 102.5)
+            self.assertAlmostEqual(tracker.unsettled_notional(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

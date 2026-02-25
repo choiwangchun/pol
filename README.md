@@ -51,6 +51,38 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
 
 `--mode live`에서는 CLOB `balance/allowance`를 조회해 bankroll이 자동으로 계좌 기준으로 설정됩니다.
 
+Live 모드에서는 자동 Claim(온체인 `redeemPositions`) 루프가 기본 활성화됩니다.
+
+- 기본 주기: 60초
+- 기본 쿨다운: 동일 condition 재시도 600초
+- 대상: Data API에서 `redeemable=true` 인 포지션
+- 기본 RPC: `https://polygon-rpc.com` (`POLYGON_RPC_URL` 또는 `--polygon-rpc-url`로 변경 가능)
+
+중요: 현재 자동 Claim은 **직접 지갑 모드(= `funder` 주소와 `private key` 주소가 동일한 경우)** 에서만 동작합니다.  
+프록시/세이프 지갑(`funder != signer`)은 자동 Claim이 비활성화되고 경고 로그만 출력됩니다.
+
+자동 Claim 옵션:
+
+```bash
+--disable-auto-claim
+--auto-claim-interval-seconds 60
+--auto-claim-size-threshold 0.0001
+--auto-claim-cooldown-seconds 600
+--auto-claim-tx-timeout-seconds 120
+--polygon-rpc-url https://polygon-rpc.com
+--data-api-base-url https://data-api.polymarket.com
+```
+
+Live 오더 리컨실 정책(기본값 안전 모드):
+
+- 기본: venue에 orphan open order가 보이면 **자동 취소하지 않고** kill-switch latch + 수동 확인
+- `--cancel-orphan-orders`: orphan order 자동 취소 허용
+
+Live 체결 집계:
+
+- `live_fill` 이벤트를 `result.json`에 반영하여 `unsettled_notional`/`available_bankroll` 계산에 사용
+- 현재 전략은 UP/DOWN 토큰을 기본적으로 `BUY`로 진입하며, 주문 객체에는 venue side(`BUY/SELL`)를 명시적으로 분리해 전달
+
 기존 `executions.csv`/`result.json` 누적 상태를 무시하고 새로 시작하려면:
 
 ```bash

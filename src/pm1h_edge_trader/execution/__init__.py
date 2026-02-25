@@ -23,6 +23,7 @@ from .types import (
     OrderStatus,
     SafetySurface,
     Side,
+    VenueOrderSide,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "SafetyGuard",
     "SafetySurface",
     "Side",
+    "VenueOrderSide",
 ]

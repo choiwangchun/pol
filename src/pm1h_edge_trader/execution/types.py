@@ -15,6 +15,11 @@ class Side(str, Enum):
     SELL = "sell"
 
 
+class VenueOrderSide(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
 class OrderStatus(str, Enum):
     OPEN = "open"
     CANCELED = "canceled"
@@ -60,6 +65,7 @@ class IntentSignal:
     seconds_to_expiry: float
     signal_ts: datetime
     allow_entry: bool = True
+    order_side: VenueOrderSide = VenueOrderSide.BUY
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,7 @@ class OrderRequest:
     price: float
     size: float
     submitted_at: datetime
+    order_side: VenueOrderSide = VenueOrderSide.BUY
 
 
 @dataclass(frozen=True)

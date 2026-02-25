@@ -93,7 +93,13 @@ class _FakeLiveOpsAdapter:
 
 
 class AppRuntimeWiringTests(unittest.TestCase):
-    def _build_config(self, *, mode: RuntimeMode, bankroll: float = 10_000.0):
+    def _build_config(
+        self,
+        *,
+        mode: RuntimeMode,
+        bankroll: float = 10_000.0,
+        cancel_orphan_orders: bool = False,
+    ):
         with TemporaryDirectory() as tmp_dir:
             return build_config(
                 mode=mode,
@@ -112,6 +118,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
                 iv_override=None,
                 log_dir=Path(tmp_dir),
                 enable_websocket=False,
+                cancel_orphan_orders=cancel_orphan_orders,
                 polymarket_live_auth=PolymarketLiveAuthConfig(
                     private_key="0x1111111111111111111111111111111111111111111111111111111111111111",
                     funder="0x2222222222222222222222222222222222222222",
@@ -360,7 +367,29 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(app._token_tick_sizes["tok-up"], 0.01)
         self.assertEqual(app._execution_engine._config.price_epsilon, 0.0005)
 
-    def test_reconcile_live_open_orders_cancels_orphans_and_drops_missing_intents(self) -> None:
+    def test_cap_order_notional_counts_active_open_intents(self) -> None:
+        config = self._build_config(mode=RuntimeMode.DRY_RUN, bankroll=100.0)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+
+        app._execution_engine._active_intents[("mkt-1", Side.BUY)] = ActiveIntent(
+            order_id="live-100",
+            market_id="mkt-1",
+            token_id="tok-up",
+            side=Side.BUY,
+            price=0.50,
+            size=10.0,
+            edge=0.03,
+            created_at=now,
+            last_quoted_at=now,
+            status=OrderStatus.OPEN,
+        )
+
+        # cap=25.0, active notional=5.0, so remaining=20.0
+        capped = app._cap_order_notional_for_market(market_id="mkt-1", suggested_notional=30.0)
+        self.assertAlmostEqual(capped, 20.0)
+
+    def test_reconcile_live_open_orders_latches_kill_switch_without_canceling_orphans_by_default(self) -> None:
         config = self._build_config(mode=RuntimeMode.LIVE)
         app = PM1HEdgeTraderApp(config)
         now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
@@ -388,8 +417,28 @@ class AppRuntimeWiringTests(unittest.TestCase):
 
         app._reconcile_live_open_orders(now=now, force=True)
 
+        self.assertNotIn("ghost-1", adapter.canceled_order_ids)
+        self.assertIn("live-100", adapter.canceled_order_ids)
+        self.assertEqual(adapter.cancel_all_calls, 0)
+        self.assertTrue(app._external_kill_switch_latched)
+        self.assertTrue(engine.kill_switch.active)
+
+    def test_reconcile_live_open_orders_can_cancel_orphans_when_enabled(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE, cancel_orphan_orders=True)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 0, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+        adapter.open_order_ids = {"ghost-1"}
+
+        app._reconcile_live_open_orders(now=now, force=True)
+
         self.assertIn("ghost-1", adapter.canceled_order_ids)
-        self.assertEqual(engine.active_intents(), {})
 
     def test_reconcile_live_open_orders_appends_live_fill_when_missing_order_is_filled(self) -> None:
         config = self._build_config(mode=RuntimeMode.LIVE)

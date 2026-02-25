@@ -288,6 +288,7 @@ class LimitOrderExecutionEngine:
             price=signal.desired_price,
             size=signal.size,
             submitted_at=now,
+            order_side=signal.order_side,
         )
         handle = self._adapter.place_limit_order(request)
         self._active_intents[(signal.market_id, signal.side)] = ActiveIntent(

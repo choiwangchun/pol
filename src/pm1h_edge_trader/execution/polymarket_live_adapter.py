@@ -12,6 +12,7 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, OrderArgs, TradeParams
     from py_clob_client.order_builder.constants import BUY as CLOB_BUY
+    from py_clob_client.order_builder.constants import SELL as CLOB_SELL
 except Exception:  # pragma: no cover - optional runtime dependency during import
     ClobClient = None  # type: ignore[assignment]
     ApiCreds = None  # type: ignore[assignment]
@@ -19,6 +20,7 @@ except Exception:  # pragma: no cover - optional runtime dependency during impor
     OrderArgs = None  # type: ignore[assignment]
     TradeParams = None  # type: ignore[assignment]
     CLOB_BUY = "BUY"  # type: ignore[assignment]
+    CLOB_SELL = "SELL"  # type: ignore[assignment]
 
 COLLATERAL_DECIMALS = 6
 COLLATERAL_SCALE = float(10**COLLATERAL_DECIMALS)
@@ -60,11 +62,14 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
     def place_limit_order(self, request: OrderRequest) -> OrderHandle:
         self._ensure_authenticated_api_creds()
         try:
+            venue_side = str(getattr(request.order_side, "value", request.order_side or CLOB_BUY)).strip().upper()
+            if venue_side not in {"BUY", "SELL"}:
+                venue_side = CLOB_BUY
             order_args = OrderArgs(  # type: ignore[misc,operator]
                 token_id=request.token_id,
                 price=float(request.price),
                 size=float(request.size),
-                side=CLOB_BUY,
+                side=CLOB_BUY if venue_side == "BUY" else CLOB_SELL,
             )
             signed_order = self._client.create_order(order_args)
             response = self._client.post_order(signed_order)
@@ -148,6 +153,20 @@ class PolymarketLiveExecutionAdapter(ExecutionAdapter):
             return None
         parsed = _safe_positive_float(value)
         return parsed
+
+    def get_conditional_address(self) -> str | None:
+        try:
+            value = self._client.get_conditional_address()
+        except Exception:
+            return None
+        return _normalize_hex_address(value)
+
+    def get_collateral_address(self) -> str | None:
+        try:
+            value = self._client.get_collateral_address()
+        except Exception:
+            return None
+        return _normalize_hex_address(value)
 
     def get_collateral_balance_allowance(self, *, refresh: bool = True) -> tuple[float | None, float | None]:
         self._ensure_authenticated_api_creds()
@@ -391,6 +410,19 @@ def _safe_positive_float(value: object) -> float | None:
     except ValueError:
         return None
     return parsed if parsed > 0.0 else None
+
+
+def _normalize_hex_address(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if len(normalized) != 42 or not normalized.startswith("0x"):
+        return None
+    try:
+        int(normalized[2:], 16)
+    except ValueError:
+        return None
+    return normalized
 
 
 def _build_balance_allowance_params() -> object:
