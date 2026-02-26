@@ -751,7 +751,6 @@ class PM1HEdgeTraderApp:
                     vol_ratio_threshold=config.policy.vol_ratio_threshold,
                     spread_tight_threshold=config.policy.spread_tight_threshold,
                     dataset_path=config.logging.root_dir / config.policy.dataset_csv_name,
-                    state_path=config.runtime_state.state_dir / config.policy.state_json_name,
                 ),
                 base_decision_config=self._base_decision_config,
             )

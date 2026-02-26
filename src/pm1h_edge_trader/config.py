@@ -95,7 +95,6 @@ class PolicyConfig:
     vol_ratio_threshold: float = 1.1
     spread_tight_threshold: float = 0.03
     dataset_csv_name: str = "policy_dataset.csv"
-    state_json_name: str = "policy_state.json"
 
 
 @dataclass(slots=True, frozen=True)

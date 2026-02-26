@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import csv
-import json
 from dataclasses import dataclass
 from datetime import datetime
 from math import log, sqrt
 from pathlib import Path
 from random import Random
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from ..engine import DecisionConfig
 from ..logger.models import ExecutionLogRecord
@@ -24,7 +23,6 @@ class PolicyBanditConfig:
     vol_ratio_threshold: float = 1.1
     spread_tight_threshold: float = 0.03
     dataset_path: Path = Path("logs/policy_dataset.csv")
-    state_path: Path = Path("logs/policy_state.json")
 
 
 @dataclass(frozen=True)
@@ -165,7 +163,6 @@ class PolicyBanditController:
         self._stats: dict[str, dict[str, _BanditArmStats]] = {}
         self._pending: dict[str, _PendingEpisode] = {}
         self._dataset = PolicyDatasetReporter(config.dataset_path)
-        self._load_state()
 
     @property
     def enabled(self) -> bool:
@@ -179,7 +176,6 @@ class PolicyBanditController:
         self._stats = {}
         self._pending = {}
         self._dataset.reset()
-        self._save_state()
 
     def export_state(self) -> dict[str, object]:
         contexts: dict[str, dict[str, dict[str, float | int]]] = {}
@@ -192,32 +188,76 @@ class PolicyBanditController:
                     "mean_reward": stats.mean_reward,
                 }
             contexts[context_id] = serialized
+        pending: list[dict[str, object]] = []
+        for order_id in sorted(self._pending.keys()):
+            episode = self._pending[order_id]
+            pending.append(
+                {
+                    "order_id": episode.order_id,
+                    "selection": _serialize_selection(episode.selection),
+                    "side": episode.side,
+                    "fill_price": episode.fill_price,
+                    "fill_size": episode.fill_size,
+                    "order_notional": episode.order_notional,
+                }
+            )
         return {
             "updated_at": datetime.utcnow().isoformat(),
             "contexts": contexts,
+            "pending": pending,
         }
 
     def import_state(self, payload: dict[str, object]) -> None:
-        contexts = payload.get("contexts")
-        if not isinstance(contexts, dict):
-            return
         self._stats = {}
-        for context_id, profile_map in contexts.items():
-            if not isinstance(profile_map, dict):
-                continue
-            typed_map: dict[str, _BanditArmStats] = {}
-            for profile_id, raw in profile_map.items():
-                if not isinstance(raw, dict):
+        contexts = payload.get("contexts")
+        if isinstance(contexts, dict):
+            for context_id, profile_map in contexts.items():
+                if not isinstance(profile_map, dict):
                     continue
-                count = raw.get("count")
-                total_reward = raw.get("total_reward")
-                if not isinstance(count, int):
+                typed_map: dict[str, _BanditArmStats] = {}
+                for profile_id, raw in profile_map.items():
+                    if not isinstance(raw, dict):
+                        continue
+                    count = raw.get("count")
+                    total_reward = raw.get("total_reward")
+                    if not isinstance(count, int):
+                        continue
+                    if not isinstance(total_reward, (float, int)):
+                        continue
+                    typed_map[profile_id] = _BanditArmStats(count=count, total_reward=float(total_reward))
+                if typed_map:
+                    self._stats[str(context_id)] = typed_map
+
+        self._pending = {}
+        pending_rows = payload.get("pending")
+        if isinstance(pending_rows, list):
+            for row in pending_rows:
+                if not isinstance(row, Mapping):
                     continue
-                if not isinstance(total_reward, (float, int)):
+                order_id = str(row.get("order_id") or "").strip()
+                selection_raw = row.get("selection")
+                selection = _deserialize_selection(selection_raw)
+                side = str(row.get("side") or "").strip()
+                fill_price = _safe_float(row.get("fill_price"))
+                fill_size = _safe_float(row.get("fill_size"))
+                order_notional = _safe_float(row.get("order_notional"))
+                if (
+                    not order_id
+                    or selection is None
+                    or not side
+                    or fill_price is None
+                    or fill_size is None
+                    or order_notional is None
+                ):
                     continue
-                typed_map[profile_id] = _BanditArmStats(count=count, total_reward=float(total_reward))
-            if typed_map:
-                self._stats[str(context_id)] = typed_map
+                self._pending[order_id] = _PendingEpisode(
+                    order_id=order_id,
+                    selection=selection,
+                    side=side,
+                    fill_price=fill_price,
+                    fill_size=fill_size,
+                    order_notional=order_notional,
+                )
 
     def select_profile(
         self,
@@ -429,25 +469,6 @@ class PolicyBanditController:
         arm = context_stats.setdefault(profile_id, _BanditArmStats())
         arm.count += 1
         arm.total_reward += reward
-        self._save_state()
-
-    def _load_state(self) -> None:
-        path = self._config.state_path
-        if not path.exists():
-            return
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return
-        if isinstance(payload, dict):
-            self.import_state(payload)
-
-    def _save_state(self) -> None:
-        payload = self.export_state()
-        path = self._config.state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-
 
 def _default_profiles() -> dict[str, PolicyProfile]:
     return {
@@ -515,3 +536,120 @@ def _serialize_row(row: dict[str, object]) -> dict[str, object]:
             continue
         serialized[key] = value
     return serialized
+
+
+def _serialize_selection(selection: PolicySelection) -> dict[str, object]:
+    return {
+        "timestamp": selection.timestamp.isoformat(),
+        "market_id": selection.market_id,
+        "context_id": selection.context_id,
+        "chosen_profile_id": selection.chosen_profile_id,
+        "applied_profile_id": selection.applied_profile_id,
+        "exploration": selection.exploration,
+        "bankroll_at_entry": selection.bankroll_at_entry,
+        "seconds_to_expiry": selection.seconds_to_expiry,
+        "rv_long": selection.rv_long,
+        "rv_short": selection.rv_short,
+        "iv": selection.iv,
+        "sigma": selection.sigma,
+        "spot": selection.spot,
+        "strike": selection.strike,
+        "bid_up": selection.bid_up,
+        "ask_up": selection.ask_up,
+        "bid_down": selection.bid_down,
+        "ask_down": selection.ask_down,
+        "spread": selection.spread,
+    }
+
+
+def _deserialize_selection(raw: object) -> PolicySelection | None:
+    if not isinstance(raw, Mapping):
+        return None
+    timestamp = _parse_datetime(raw.get("timestamp"))
+    if timestamp is None:
+        return None
+    market_id = str(raw.get("market_id") or "").strip()
+    context_id = str(raw.get("context_id") or "").strip()
+    chosen_profile_id = str(raw.get("chosen_profile_id") or "").strip()
+    applied_profile_id = str(raw.get("applied_profile_id") or "").strip()
+    exploration = bool(raw.get("exploration", False))
+    bankroll_at_entry = _safe_float(raw.get("bankroll_at_entry"))
+    seconds_to_expiry = _safe_float(raw.get("seconds_to_expiry"))
+    rv_long = _safe_float(raw.get("rv_long"))
+    rv_short = _safe_float(raw.get("rv_short"))
+    sigma = _safe_float(raw.get("sigma"))
+    spot = _safe_float(raw.get("spot"))
+    strike = _safe_float(raw.get("strike"))
+    bid_up = _safe_float(raw.get("bid_up"))
+    ask_up = _safe_float(raw.get("ask_up"))
+    bid_down = _safe_float(raw.get("bid_down"))
+    ask_down = _safe_float(raw.get("ask_down"))
+    spread = _safe_float(raw.get("spread"))
+    if (
+        not market_id
+        or not context_id
+        or not chosen_profile_id
+        or not applied_profile_id
+        or bankroll_at_entry is None
+        or seconds_to_expiry is None
+        or rv_long is None
+        or rv_short is None
+        or sigma is None
+        or spot is None
+        or strike is None
+        or bid_up is None
+        or ask_up is None
+        or bid_down is None
+        or ask_down is None
+        or spread is None
+    ):
+        return None
+    iv_raw = raw.get("iv")
+    iv = _safe_float(iv_raw) if iv_raw is not None else None
+    return PolicySelection(
+        timestamp=timestamp,
+        market_id=market_id,
+        context_id=context_id,
+        chosen_profile_id=chosen_profile_id,
+        applied_profile_id=applied_profile_id,
+        exploration=exploration,
+        bankroll_at_entry=bankroll_at_entry,
+        seconds_to_expiry=seconds_to_expiry,
+        rv_long=rv_long,
+        rv_short=rv_short,
+        iv=iv,
+        sigma=sigma,
+        spot=spot,
+        strike=strike,
+        bid_up=bid_up,
+        ask_up=ask_up,
+        bid_down=bid_down,
+        ask_down=ask_down,
+        spread=spread,
+    )
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _safe_float(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None

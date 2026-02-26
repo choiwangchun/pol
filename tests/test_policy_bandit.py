@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -54,7 +53,6 @@ class PolicyBanditTests(unittest.TestCase):
                 vol_ratio_threshold=1.1,
                 spread_tight_threshold=0.03,
                 dataset_path=Path(tmp_dir) / "policy_dataset.csv",
-                state_path=Path(tmp_dir) / "policy_state.json",
             ),
             base_decision_config=DecisionConfig(
                 sigma_weight=1.0,
@@ -208,8 +206,7 @@ class PolicyBanditTests(unittest.TestCase):
             self.assertIsNotNone(reward)
             self.assertGreater(reward or 0.0, 0.0)
 
-            with (Path(tmp_dir) / "policy_state.json").open("r", encoding="utf-8") as fp:
-                state = json.load(fp)
+            state = controller.export_state()
             context_bucket = selection.context_id
             profile_bucket = selection.applied_profile_id
             self.assertEqual(

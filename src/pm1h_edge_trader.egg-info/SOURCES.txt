@@ -79,6 +79,7 @@ tests/test_paper_result_tracker.py
 tests/test_paper_settlement.py
 tests/test_policy_adaptive_layers.py
 tests/test_policy_bandit.py
+tests/test_policy_bandit_pending_roundtrip.py
 tests/test_policy_runtime_wiring.py
 tests/test_polymarket_live_adapter.py
 tests/test_positions_reconciler.py
