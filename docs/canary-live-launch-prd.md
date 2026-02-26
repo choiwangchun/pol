@@ -11,6 +11,7 @@
 - Kill-switch 트리거 시 즉시 주문 정리 + 신규 진입 중단 확인.
 - `live_fill` + partial fill 누적 반영과 `result.json` 노출 값 정합성 확인.
 - 알림/운영 대응이 1분 내 동작하고 Emergency Stop 후 open orders가 0으로 수렴.
+- `live_drawdown_limit` 트리거 시나리오를 재현하고(의도적 낮은 threshold), kill 동작을 확인.
 
 ## 3. 카나리 단계
 ### Stage 0: Live 연결 검증 (No-Trade)
@@ -18,7 +19,7 @@
 - 권장 명령:
 
 ```bash
-PYTHONPATH=src python -m pm1h_edge_trader.main \
+PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode live \
   --edge-min 1.0 \
   --max-market-notional 1 \
@@ -33,9 +34,10 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
 - 권장 시작 범위:
 1. `--max-market-notional 5~25`
 2. `--max-daily-loss 2~10`
-3. `--f-cap 0.005~0.01`
-4. `--kelly-fraction 0.05~0.10`
-5. `--max-entries-per-market 1`
+3. `--max-live-drawdown 1~5` (카나리에서는 낮게 시작)
+4. `--f-cap 0.005~0.01`
+5. `--kelly-fraction 0.05~0.10`
+6. `--max-entries-per-market 1`
 
 ### Stage 2: 운영 드릴
 - heartbeat 중단, cancel-all, position mismatch 케이스를 강제로 발생시켜 런북 검증.

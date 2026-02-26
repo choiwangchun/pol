@@ -15,16 +15,14 @@ Polymarket BTC 1H Up/Down market에서 Binance 기반 공정확률 `q`를 계산
 ## 실행
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-pm1h-edge-trader --help
+uv sync --python 3.11
+uv run --python 3.11 pm1h-edge-trader --help
 ```
 
 한 사이클 dry-run:
 
 ```bash
-PYTHONPATH=src python -m pm1h_edge_trader.main \
+PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode dry-run \
   --max-ticks 1 \
   --disable-websocket
@@ -33,7 +31,7 @@ PYTHONPATH=src python -m pm1h_edge_trader.main \
 특정 시장을 강제 지정하려면:
 
 ```bash
-PYTHONPATH=src python -m pm1h_edge_trader.main \
+PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode dry-run \
   --market-slug bitcoin-up-or-down-february-16-1am-et \
   --max-ticks 1
@@ -44,7 +42,7 @@ live 모드(실주문):
 ```bash
 export POLYMARKET_PRIVATE_KEY=...
 export POLYMARKET_FUNDER=...
-PYTHONPATH=src python -m pm1h_edge_trader.main \
+PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode live \
   --max-ticks 1
 ```
@@ -86,10 +84,14 @@ Safety + Recon + Arb 옵션(기본은 안전/옵트인):
 ```bash
 --hard-kill-on-daily-loss         # 기본 ON (비활성화: --no-hard-kill-on-daily-loss)
 --max-worst-case-loss 3500        # 미정산+오픈오더 notional 기반 손실 프록시 상한
+--max-live-drawdown 50            # Live bankroll 기준 세션 드로우다운 상한(0이면 비활성)
+--live-balance-refresh-seconds 30 # Live 잔액/allowance 폴링 주기
 --position-reconcile-interval-seconds 10
 --position-mismatch-policy kill   # kill | block | warn
 --position-size-threshold 0.0001
 --position-size-relative-tolerance 0.05
+--adopt-existing-positions
+--adopt-existing-positions-policy block  # kill | block | warn
 
 --enable-complete-set-arb
 --arb-min-profit 0.0
@@ -98,7 +100,10 @@ Safety + Recon + Arb 옵션(기본은 안전/옵트인):
 ```
 
 - `kill-switch reason` 확장: `daily_loss_limit`, `bankroll_depleted`, `market_notional_limit_breach`, `worst_case_loss_limit`, `position_mismatch`
+- `kill-switch reason` 확장: `daily_loss_limit`, `bankroll_depleted`, `market_notional_limit_breach`, `worst_case_loss_limit`, `live_drawdown_limit`, `position_mismatch`
 - 포지션 리컨실은 Live 지갑 포지션(Data API `/positions`)과 로컬 노출을 비교합니다.
+- `--max-daily-loss`는 settled(실현손익) 기준 보호입니다. Live 운영 중 즉시 보호는 `--max-live-drawdown`으로 추가할 수 있습니다.
+- `--adopt-existing-positions`를 켜면 재기동 시 외부(지갑) 포지션 감지 시 kill 대신 진입 차단(block/warn/kill 정책)으로 운영할 수 있습니다.
 - complete-set arb는 기본 OFF이며 `ask_up + ask_down < 1`일 때만 페어 매수를 시도합니다.
 
 Live 오더 리컨실 정책(기본값 안전 모드):
@@ -118,7 +123,7 @@ Live 체결 집계:
 기존 `executions.csv`/`result.json` 누적 상태를 무시하고 새로 시작하려면:
 
 ```bash
-PYTHONPATH=src python -m pm1h_edge_trader.main \
+PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode dry-run \
   --fresh-start
 ```
@@ -157,8 +162,8 @@ PY
 ## 테스트
 
 ```bash
-python3 -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
-python3 -m unittest discover -s tests -p "test_*.py" -v
+uv run --python 3.11 python -m unittest -q src/pm1h_edge_trader/engine/tests/test_math_engine.py
+uv run --python 3.11 python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ## Canary 운영

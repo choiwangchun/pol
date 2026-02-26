@@ -18,7 +18,7 @@ from pm1h_edge_trader.execution import (  # noqa: E402
     OrderHandle,
     OrderStatus,
     SafetySurface,
-    Side,
+    OutcomeSide,
 )
 
 
@@ -47,7 +47,7 @@ class ExecutionEngineTokenIdTests(unittest.TestCase):
         signal = IntentSignal(
             market_id="mkt-1",
             token_id="token-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             edge=0.05,
             min_edge=0.01,
             desired_price=0.55,
@@ -88,7 +88,7 @@ class ExecutionEngineTokenIdTests(unittest.TestCase):
         first = IntentSignal(
             market_id="mkt-1",
             token_id="token-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             edge=0.05,
             min_edge=0.01,
             desired_price=0.55,
@@ -100,7 +100,7 @@ class ExecutionEngineTokenIdTests(unittest.TestCase):
         second = IntentSignal(
             market_id="mkt-1",
             token_id="token-down",
-            side=Side.SELL,
+            side=OutcomeSide.DOWN,
             edge=0.04,
             min_edge=0.01,
             desired_price=0.45,

@@ -17,7 +17,6 @@ from .types import (
     OrderRequest,
     OrderStatus,
     SafetySurface,
-    Side,
     utc_now,
 )
 

@@ -11,7 +11,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from pm1h_edge_trader.config import PolymarketLiveAuthConfig  # noqa: E402
-from pm1h_edge_trader.execution import OrderRequest, Side, VenueOrderSide  # noqa: E402
+from pm1h_edge_trader.execution import OrderRequest, OutcomeSide, VenueOrderSide  # noqa: E402
 from pm1h_edge_trader.execution.polymarket_live_adapter import (  # noqa: E402
     PolymarketLiveExecutionAdapter,
 )
@@ -171,7 +171,7 @@ class PolymarketLiveAdapterTests(unittest.TestCase):
         return OrderRequest(
             market_id="market-1",
             token_id="token-down",
-            side=Side.SELL,
+            side=OutcomeSide.DOWN,
             order_side=order_side,
             price=0.47,
             size=21.0,

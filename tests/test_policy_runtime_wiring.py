@@ -16,7 +16,7 @@ from pm1h_edge_trader.execution import (  # noqa: E402
     ExecutionAction,
     ExecutionActionType,
     IntentSignal,
-    Side,
+    OutcomeSide,
 )
 from pm1h_edge_trader.feeds.models import BestQuote, UnderlyingSnapshot  # noqa: E402
 from pm1h_edge_trader.main import PM1HEdgeTraderApp, build_arg_parser  # noqa: E402
@@ -91,7 +91,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
             "tok-up": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-up",
-                side=Side.BUY,
+                side=OutcomeSide.UP,
                 edge=0.02,
                 min_edge=0.01,
                 desired_price=0.55,
@@ -103,7 +103,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
             "tok-down": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-down",
-                side=Side.SELL,
+                side=OutcomeSide.DOWN,
                 edge=0.0,
                 min_edge=0.01,
                 desired_price=0.45,
@@ -117,7 +117,7 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
             action_type=ExecutionActionType.PLACE,
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             order_id="dry-77",
             reason="new_intent",
         )

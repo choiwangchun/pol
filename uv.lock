@@ -1013,7 +1013,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "py-clob-client" },
+    { name = "py-clob-client", specifier = "==0.34.6" },
     { name = "web3", specifier = ">=6,<8" },
 ]
 

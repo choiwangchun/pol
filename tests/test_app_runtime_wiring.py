@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 import csv
+import asyncio
 from datetime import datetime, timezone
 from datetime import timedelta
 from pathlib import Path
@@ -32,7 +33,7 @@ from pm1h_edge_trader.execution import (  # noqa: E402
     OrderHandle,
     OrderRequest,
     OrderStatus,
-    Side,
+    OutcomeSide,
 )
 from pm1h_edge_trader.execution.polymarket_live_adapter import (  # noqa: E402
     PolymarketLiveExecutionAdapter,
@@ -112,6 +113,11 @@ class AppRuntimeWiringTests(unittest.TestCase):
         bankroll: float = 10_000.0,
         cancel_orphan_orders: bool = False,
         enable_complete_set_arb: bool = False,
+        adopt_existing_positions: bool = False,
+        adopt_existing_positions_policy: str = "block",
+        position_mismatch_policy: str = "kill",
+        max_live_drawdown: float = 0.0,
+        live_balance_refresh_seconds: float = 30.0,
     ):
         with TemporaryDirectory() as tmp_dir:
             return build_config(
@@ -133,6 +139,11 @@ class AppRuntimeWiringTests(unittest.TestCase):
                 enable_websocket=False,
                 cancel_orphan_orders=cancel_orphan_orders,
                 enable_complete_set_arb=enable_complete_set_arb,
+                adopt_existing_positions=adopt_existing_positions,
+                adopt_existing_positions_policy=adopt_existing_positions_policy,
+                position_mismatch_policy=position_mismatch_policy,
+                max_live_drawdown=max_live_drawdown,
+                live_balance_refresh_seconds=live_balance_refresh_seconds,
                 polymarket_live_auth=PolymarketLiveAuthConfig(
                     private_key="0x1111111111111111111111111111111111111111111111111111111111111111",
                     funder="0x2222222222222222222222222222222222222222",
@@ -196,7 +207,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             OrderRequest(
                 market_id="mkt-1",
                 token_id="tok-up",
-                side=Side.BUY,
+                side=OutcomeSide.UP,
                 price=0.55,
                 size=10.0,
                 submitted_at=now,
@@ -207,7 +218,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id=handle.order_id,
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.55,
             size=10.0,
             edge=0.02,
@@ -220,7 +231,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             "tok-up": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-up",
-                side=Side.BUY,
+                side=OutcomeSide.UP,
                 edge=0.02,
                 min_edge=0.01,
                 desired_price=0.55,
@@ -232,7 +243,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             "tok-down": IntentSignal(
                 market_id="mkt-1",
                 token_id="tok-down",
-                side=Side.SELL,
+                side=OutcomeSide.DOWN,
                 edge=0.0,
                 min_edge=0.01,
                 desired_price=0.45,
@@ -246,7 +257,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             action_type=ExecutionActionType.PLACE,
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             order_id=handle.order_id,
             reason="new_intent",
         )
@@ -403,7 +414,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.50,
             size=10.0,
             edge=0.03,
@@ -432,7 +443,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.50,
             size=10.0,
             edge=0.03,
@@ -483,7 +494,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.50,
             size=10.0,
             edge=0.03,
@@ -538,7 +549,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.50,
             size=10.0,
             edge=0.03,
@@ -602,7 +613,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.50,
             size=10.0,
             edge=0.03,
@@ -640,6 +651,32 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertTrue(app._external_kill_switch_latched)
         self.assertTrue(engine.kill_switch.active)
 
+    def test_live_drawdown_guard_latches_kill_switch(self) -> None:
+        config = self._build_config(mode=RuntimeMode.LIVE, max_live_drawdown=5.0)
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 21, 8, 5, tzinfo=timezone.utc)
+        adapter = _FakeLiveOpsAdapter(now=now)
+        engine = LimitOrderExecutionEngine(
+            adapter=adapter,
+            config=ExecutionConfig(entry_block_window_s=60.0),
+            now_fn=lambda: now,
+        )
+        app._execution_engine = engine
+        app._live_balance_monitor = SimpleNamespace(
+            maybe_refresh=lambda *, now: SimpleNamespace(
+                triggered=True,
+                drawdown=6.0,
+                baseline=SimpleNamespace(bankroll=100.0),
+                snapshot=SimpleNamespace(bankroll=94.0),
+            )
+        )
+
+        app._run_live_drawdown_guard(now=now)
+
+        self.assertTrue(app._external_kill_switch_latched)
+        self.assertTrue(engine.kill_switch.active)
+        self.assertEqual(adapter.cancel_all_calls, 1)
+
     def test_complete_set_one_leg_timeout_attempts_recovery_before_kill(self) -> None:
         config = self._build_config(mode=RuntimeMode.LIVE, enable_complete_set_arb=True)
         app = PM1HEdgeTraderApp(config)
@@ -653,12 +690,12 @@ class AppRuntimeWiringTests(unittest.TestCase):
         app._execution_engine = engine
         app._token_tick_sizes = {"tok-up": 0.01, "tok-down": 0.01}
         app._arb_one_leg_started_at = now - timedelta(seconds=120)
-        app._apply_live_market_side_exposure(market_id="mkt-1", side=Side.BUY, delta_tokens=3.0)
+        app._apply_live_market_side_exposure(market_id="mkt-1", side=OutcomeSide.UP, delta_tokens=3.0)
         engine._active_intents[("mkt-1", "tok-up")] = ActiveIntent(
             order_id="live-100",
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.60,
             size=3.0,
             edge=0.03,
@@ -701,6 +738,31 @@ class AppRuntimeWiringTests(unittest.TestCase):
         self.assertEqual(adapter.place_requests[-1].token_id, "tok-down")
         self.assertEqual(adapter.place_requests[-1].order_side.value, "BUY")
 
+    def test_reconcile_live_positions_adopt_mode_blocks_without_kill(self) -> None:
+        config = self._build_config(
+            mode=RuntimeMode.LIVE,
+            adopt_existing_positions=True,
+            adopt_existing_positions_policy="block",
+            position_mismatch_policy="kill",
+        )
+        app = PM1HEdgeTraderApp(config)
+        now = datetime(2026, 2, 26, 1, 0, tzinfo=timezone.utc)
+        app._market = SimpleNamespace(
+            market_id="mkt-1",
+            token_ids=SimpleNamespace(up_token_id="tok-up", down_token_id="tok-down"),
+        )
+
+        class _PositionsClient:
+            async def fetch_positions(self, *, user_address: str, size_threshold: float):  # type: ignore[no-untyped-def]
+                return [{"asset": "tok-up", "size": "1.0"}]
+
+        app._positions_client = _PositionsClient()
+        asyncio.run(app._reconcile_live_positions(now=now, force=True))
+
+        self.assertTrue(app._position_mismatch_blocked)
+        self.assertFalse(app._external_kill_switch_latched)
+        self.assertEqual(app._entry_block_reason(now=now, market_id="mkt-1"), "position_mismatch")
+
     def test_near_expiry_cleanup_cancels_existing_intents_once(self) -> None:
         config = self._build_config(mode=RuntimeMode.DRY_RUN)
         app = PM1HEdgeTraderApp(config)
@@ -712,7 +774,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             OrderRequest(
                 market_id="mkt-1",
                 token_id="tok-up",
-                side=Side.BUY,
+                side=OutcomeSide.UP,
                 price=0.55,
                 size=10.0,
                 submitted_at=now,
@@ -722,7 +784,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
             order_id=handle.order_id,
             market_id="mkt-1",
             token_id="tok-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             price=0.55,
             size=10.0,
             edge=0.02,

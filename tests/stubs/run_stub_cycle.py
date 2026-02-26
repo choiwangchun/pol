@@ -17,8 +17,8 @@ from pm1h_edge_trader.execution import (
     ExecutionConfig,
     IntentSignal,
     LimitOrderExecutionEngine,
+    OutcomeSide,
     SafetySurface,
-    Side,
 )
 
 
@@ -28,12 +28,12 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _parse_side(value: str) -> Side:
+def _parse_side(value: str) -> OutcomeSide:
     normalized = value.strip().lower()
-    if normalized == "buy":
-        return Side.BUY
-    if normalized == "sell":
-        return Side.SELL
+    if normalized in {"buy", "up"}:
+        return OutcomeSide.UP
+    if normalized in {"sell", "down"}:
+        return OutcomeSide.DOWN
     raise ValueError(f"unsupported side: {value}")
 
 

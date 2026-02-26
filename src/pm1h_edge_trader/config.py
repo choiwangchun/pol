@@ -114,6 +114,8 @@ class PositionReconcileConfig:
     mismatch_policy: str = "kill"
     size_threshold: float = 0.0001
     size_relative_tolerance: float = 0.05
+    adopt_existing_positions: bool = False
+    adopt_existing_positions_policy: str = "block"
     data_api_base_url: str = "https://data-api.polymarket.com"
 
 
@@ -134,6 +136,8 @@ class RiskConfig:
     max_market_notional: float = 2_500.0
     max_daily_loss: float = 2_000.0
     max_worst_case_loss: float = 3_500.0
+    max_live_drawdown: float = 0.0
+    live_balance_refresh_seconds: float = 30.0
     max_entries_per_market: int = 1
 
 
@@ -222,6 +226,8 @@ def build_config(
     max_market_notional: float | None = None,
     max_daily_loss: float | None = None,
     max_worst_case_loss: float | None = None,
+    max_live_drawdown: float = 0.0,
+    live_balance_refresh_seconds: float = 30.0,
     max_entries_per_market: int = 1,
     rv_interval: str | None = None,
     rv_ewma_half_life: float | None = None,
@@ -252,6 +258,8 @@ def build_config(
     position_mismatch_policy: str = "kill",
     position_size_threshold: float = 0.0001,
     position_size_relative_tolerance: float = 0.05,
+    adopt_existing_positions: bool = False,
+    adopt_existing_positions_policy: str = "block",
     hard_kill_on_daily_loss: bool = True,
     enable_complete_set_arb: bool = False,
     arb_min_profit: float = 0.0,
@@ -274,6 +282,9 @@ def build_config(
     normalized_mismatch_policy = str(position_mismatch_policy).strip().lower() or "kill"
     if normalized_mismatch_policy not in {"kill", "block", "warn"}:
         normalized_mismatch_policy = "kill"
+    normalized_adopt_policy = str(adopt_existing_positions_policy).strip().lower() or "block"
+    if normalized_adopt_policy not in {"kill", "block", "warn"}:
+        normalized_adopt_policy = "block"
     entry_limit = max(1, max_entries_per_market)
     if enable_complete_set_arb:
         entry_limit = max(entry_limit, 2)
@@ -330,6 +341,8 @@ def build_config(
             mismatch_policy=normalized_mismatch_policy,
             size_threshold=max(0.0, position_size_threshold),
             size_relative_tolerance=max(0.0, position_size_relative_tolerance),
+            adopt_existing_positions=bool(adopt_existing_positions),
+            adopt_existing_positions_policy=normalized_adopt_policy,
             data_api_base_url=data_api_base_url.strip() or "https://data-api.polymarket.com",
         ),
         complete_set_arb=CompleteSetArbConfig(
@@ -346,6 +359,8 @@ def build_config(
             max_market_notional=max(0.0, market_notional_cap),
             max_daily_loss=max(0.0, daily_loss_cap),
             max_worst_case_loss=max(0.0, worst_case_loss_cap),
+            max_live_drawdown=max(0.0, max_live_drawdown),
+            live_balance_refresh_seconds=max(1.0, live_balance_refresh_seconds),
             max_entries_per_market=entry_limit,
         ),
         loop=LoopConfig(

@@ -15,6 +15,11 @@ class Side(str, Enum):
     SELL = "sell"
 
 
+class OutcomeSide(str, Enum):
+    UP = "up"
+    DOWN = "down"
+
+
 class VenueOrderSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -47,6 +52,7 @@ class KillSwitchReason(str, Enum):
     BANKROLL_DEPLETED = "bankroll_depleted"
     MARKET_NOTIONAL_LIMIT_BREACH = "market_notional_limit_breach"
     WORST_CASE_LOSS_LIMIT = "worst_case_loss_limit"
+    LIVE_DRAWDOWN_LIMIT = "live_drawdown_limit"
     POSITION_MISMATCH = "position_mismatch"
 
 
@@ -62,7 +68,7 @@ class SafetySurface:
 class IntentSignal:
     market_id: str
     token_id: str
-    side: Side
+    side: OutcomeSide
     edge: float
     min_edge: float
     desired_price: Optional[float]
@@ -77,7 +83,7 @@ class IntentSignal:
 class OrderRequest:
     market_id: str
     token_id: str
-    side: Side
+    side: OutcomeSide
     price: float
     size: float
     submitted_at: datetime
@@ -103,7 +109,7 @@ class ActiveIntent:
     order_id: str
     market_id: str
     token_id: str
-    side: Side
+    side: OutcomeSide
     price: float
     size: float
     edge: float
@@ -118,7 +124,7 @@ class ExecutionAction:
     action_type: ExecutionActionType
     market_id: str
     token_id: Optional[str] = None
-    side: Optional[Side] = None
+    side: Optional[OutcomeSide] = None
     order_id: Optional[str] = None
     reason: Optional[str] = None
 
@@ -152,3 +158,12 @@ class ExecutionResult:
     @property
     def kill_switch_active(self) -> bool:
         return self.kill_switch.active
+
+
+def parse_outcome_side(text: str) -> OutcomeSide | None:
+    normalized = str(text).strip().lower()
+    if normalized in {"up", "u", "yes", "y"}:
+        return OutcomeSide.UP
+    if normalized in {"down", "d", "no", "n"}:
+        return OutcomeSide.DOWN
+    return None

@@ -33,9 +33,9 @@ from .execution import (
     IntentSignal,
     KillSwitchReason,
     LimitOrderExecutionEngine,
+    OutcomeSide,
     PolymarketLiveExecutionAdapter,
     SafetySurface,
-    Side,
     VenueOrderSide,
 )
 from .feeds import BinanceUnderlyingAdapter, ClobOrderbookAdapter
@@ -48,7 +48,7 @@ from .markets import FeeRateGuardClient, GammaMarketDiscoveryClient, MarketCandi
 from .paper import PaperResultTracker, PaperSettlementCoordinator, PolymarketMarketResolutionResolver
 from .policy import PolicyBanditConfig, PolicyBanditController, PolicySelection
 from .positions import DataApiPositionsClient, evaluate_position_mismatch, extract_position_snapshot
-from .risk import CircuitBreakerSnapshot, evaluate_circuit_breaker
+from .risk import CircuitBreakerSnapshot, LiveBalanceMonitor, evaluate_circuit_breaker
 from .strategy import CompleteSetArbDecision, decide_complete_set_arb
 
 LOGGER = logging.getLogger("pm1h_edge_trader")
@@ -135,6 +135,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Hard cap for worst-case loss proxy (unsettled + open-order notional). Default: 35%% of bankroll.",
+    )
+    parser.add_argument(
+        "--max-live-drawdown",
+        type=float,
+        default=0.0,
+        help="Hard cap for live bankroll drawdown from session baseline. 0 disables.",
+    )
+    parser.add_argument(
+        "--live-balance-refresh-seconds",
+        type=float,
+        default=30.0,
+        help="Refresh interval for live balance polling used by drawdown guard.",
     )
     parser.add_argument(
         "--max-entries-per-market",
@@ -341,6 +353,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="Relative tolerance for wallet-vs-local position size divergence checks.",
+    )
+    parser.add_argument(
+        "--adopt-existing-positions",
+        action="store_true",
+        help="On restart, block new entries instead of immediate kill when wallet has unexpected positions.",
+    )
+    parser.add_argument(
+        "--adopt-existing-positions-policy",
+        choices=["kill", "block", "warn"],
+        default="block",
+        help="Policy for adopt mode when wallet-only positions are detected.",
     )
     parser.add_argument(
         "--enable-complete-set-arb",
@@ -711,9 +734,10 @@ class PM1HEdgeTraderApp:
         self._next_auto_claim_check: datetime | None = None
         self._auto_claim_init_failed = False
         self._positions_client: DataApiPositionsClient | None = None
+        self._live_balance_monitor: LiveBalanceMonitor | None = None
         self._arb_one_leg_started_at: datetime | None = None
         self._live_order_matched_sizes: dict[str, float] = {}
-        self._live_market_side_exposure_tokens: dict[tuple[str, Side], float] = {}
+        self._live_market_side_exposure_tokens: dict[tuple[str, OutcomeSide], float] = {}
 
         if config.mode == RuntimeMode.DRY_RUN:
             resolver = PolymarketMarketResolutionResolver(
@@ -739,6 +763,13 @@ class PM1HEdgeTraderApp:
             self._positions_client = DataApiPositionsClient(
                 base_url=config.position_reconcile.data_api_base_url,
             )
+            if config.risk.max_live_drawdown > 0.0:
+                self._live_balance_monitor = LiveBalanceMonitor(
+                    auth=config.polymarket_live_auth,
+                    host=config.polymarket.clob_rest_base_url,
+                    refresh_seconds=config.risk.live_balance_refresh_seconds,
+                    max_drawdown=config.risk.max_live_drawdown,
+                )
 
     async def run(self, stop_event: asyncio.Event) -> None:
         await self._bootstrap_runtime()
@@ -905,6 +936,7 @@ class PM1HEdgeTraderApp:
         self._reconcile_live_open_orders(now=now)
         self._run_live_auto_claim(now=now)
         await self._reconcile_live_positions(now=now)
+        self._run_live_drawdown_guard(now=now)
 
         await self._refresh_fee_state(now=now)
         max_fee_rate = self._fee_state.max_fee_rate if self._fee_state is not None else 0.0
@@ -1198,6 +1230,32 @@ class PM1HEdgeTraderApp:
         interval = max(5.0, self._config.auto_claim.interval_seconds)
         self._next_auto_claim_check = now + timedelta(seconds=interval)
 
+    def _run_live_drawdown_guard(self, *, now: datetime) -> None:
+        if self._config.mode != RuntimeMode.LIVE:
+            return
+        monitor = self._live_balance_monitor
+        if monitor is None:
+            return
+        try:
+            check = monitor.maybe_refresh(now=now)
+        except Exception as exc:
+            LOGGER.warning("live_drawdown_refresh_failed error=%s", exc)
+            return
+        if check is None:
+            return
+        if check.triggered:
+            self._trigger_external_kill_switch(
+                reason=KillSwitchReason.LIVE_DRAWDOWN_LIMIT,
+                now=now,
+                message=(
+                    "Live drawdown limit reached "
+                    f"baseline={check.baseline.bankroll:.6f} "
+                    f"current={check.snapshot.bankroll:.6f} "
+                    f"drawdown={check.drawdown:.6f} "
+                    f"max={self._config.risk.max_live_drawdown:.6f}"
+                ),
+            )
+
     async def _reconcile_live_positions(self, *, now: datetime, force: bool = False) -> None:
         if self._config.mode != RuntimeMode.LIVE:
             return
@@ -1234,21 +1292,25 @@ class PM1HEdgeTraderApp:
 
         mismatch = evaluate_position_mismatch(
             snapshot=snapshot,
-            local_up_size=self._market_side_exposure_tokens(market.market_id, Side.BUY),
-            local_down_size=self._market_side_exposure_tokens(market.market_id, Side.SELL),
+            local_up_size=self._market_side_exposure_tokens(market.market_id, OutcomeSide.UP),
+            local_down_size=self._market_side_exposure_tokens(market.market_id, OutcomeSide.DOWN),
             size_threshold=self._config.position_reconcile.size_threshold,
             relative_tolerance=self._config.position_reconcile.size_relative_tolerance,
         )
         policy = self._config.position_reconcile.mismatch_policy
+        adopt_policy = self._config.position_reconcile.adopt_existing_positions_policy
+        if self._config.position_reconcile.adopt_existing_positions and mismatch.reason == "wallet_only_exposure":
+            policy = adopt_policy
         if mismatch.mismatch:
             if policy == "warn":
                 LOGGER.warning(
                     (
-                        "position_reconcile_mismatch policy=warn reason=%s "
+                        "position_reconcile_mismatch policy=warn reason=%s adopt=%s "
                         "wallet_up=%.6f wallet_down=%.6f local_up=%.6f local_down=%.6f "
                         "up_diff=%.6f down_diff=%.6f"
                     ),
                     mismatch.reason,
+                    str(self._config.position_reconcile.adopt_existing_positions).lower(),
                     mismatch.wallet_up_size,
                     mismatch.wallet_down_size,
                     mismatch.local_up_size,
@@ -1260,11 +1322,12 @@ class PM1HEdgeTraderApp:
                 self._position_mismatch_blocked = True
                 LOGGER.warning(
                     (
-                        "position_reconcile_mismatch policy=block reason=%s "
+                        "position_reconcile_mismatch policy=block reason=%s adopt=%s "
                         "wallet_up=%.6f wallet_down=%.6f local_up=%.6f local_down=%.6f "
                         "up_diff=%.6f down_diff=%.6f"
                     ),
                     mismatch.reason,
+                    str(self._config.position_reconcile.adopt_existing_positions).lower(),
                     mismatch.wallet_up_size,
                     mismatch.wallet_down_size,
                     mismatch.local_up_size,
@@ -1356,8 +1419,8 @@ class PM1HEdgeTraderApp:
         except Exception as exc:
             LOGGER.warning("complete_set_recovery_cancel_failed error=%s", exc)
 
-        up_exposure = max(0.0, self._market_side_exposure_tokens(market_id, Side.BUY))
-        down_exposure = max(0.0, self._market_side_exposure_tokens(market_id, Side.SELL))
+        up_exposure = max(0.0, self._market_side_exposure_tokens(market_id, OutcomeSide.UP))
+        down_exposure = max(0.0, self._market_side_exposure_tokens(market_id, OutcomeSide.DOWN))
         imbalance = up_exposure - down_exposure
         if abs(imbalance) <= 1e-9:
             LOGGER.warning("complete_set_recovery_skipped reason=no_detected_exposure")
@@ -1367,7 +1430,7 @@ class PM1HEdgeTraderApp:
             completion_ok = self._place_recovery_order(
                 now=now,
                 market_id=market_id,
-                side=Side.SELL,
+                side=OutcomeSide.DOWN,
                 token_id=down_quote.token_id if down_quote is not None else "",
                 order_side=VenueOrderSide.BUY,
                 quote_price=down_quote.best_ask if down_quote is not None else None,
@@ -1381,7 +1444,7 @@ class PM1HEdgeTraderApp:
             unwind_ok = self._place_recovery_order(
                 now=now,
                 market_id=market_id,
-                side=Side.BUY,
+                side=OutcomeSide.UP,
                 token_id=up_quote.token_id if up_quote is not None else "",
                 order_side=VenueOrderSide.SELL,
                 quote_price=up_quote.best_bid if up_quote is not None else None,
@@ -1395,7 +1458,7 @@ class PM1HEdgeTraderApp:
         completion_ok = self._place_recovery_order(
             now=now,
             market_id=market_id,
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             token_id=up_quote.token_id if up_quote is not None else "",
             order_side=VenueOrderSide.BUY,
             quote_price=up_quote.best_ask if up_quote is not None else None,
@@ -1409,7 +1472,7 @@ class PM1HEdgeTraderApp:
         unwind_ok = self._place_recovery_order(
             now=now,
             market_id=market_id,
-            side=Side.SELL,
+            side=OutcomeSide.DOWN,
             token_id=down_quote.token_id if down_quote is not None else "",
             order_side=VenueOrderSide.SELL,
             quote_price=down_quote.best_bid if down_quote is not None else None,
@@ -1425,7 +1488,7 @@ class PM1HEdgeTraderApp:
         *,
         now: datetime,
         market_id: str,
-        side: Side,
+        side: OutcomeSide,
         token_id: str,
         order_side: VenueOrderSide,
         quote_price: float | None,
@@ -1514,7 +1577,7 @@ class PM1HEdgeTraderApp:
         data_ready: bool,
         entry_block_reason: str | None = None,
     ) -> IntentSignal:
-        side = Side.BUY if side_label == "up" else Side.SELL
+        side = OutcomeSide.UP if side_label == "up" else OutcomeSide.DOWN
         allow_entry = data_ready and entry_block_reason is None
         if decision is None or quote is None or quote.best_ask is None:
             return IntentSignal(
@@ -1596,7 +1659,7 @@ class PM1HEdgeTraderApp:
         up_signal = IntentSignal(
             market_id=market_id,
             token_id=up_quote.token_id if up_quote is not None else "",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             edge=arb.profit_per_pair,
             min_edge=self._config.complete_set_arb.min_profit,
             desired_price=up_price,
@@ -1609,7 +1672,7 @@ class PM1HEdgeTraderApp:
         down_signal = IntentSignal(
             market_id=market_id,
             token_id=down_quote.token_id if down_quote is not None else "",
-            side=Side.SELL,
+            side=OutcomeSide.DOWN,
             edge=arb.profit_per_pair,
             min_edge=self._config.complete_set_arb.min_profit,
             desired_price=down_price,
@@ -1638,10 +1701,10 @@ class PM1HEdgeTraderApp:
         if action.token_id is not None:
             side_signal = signal_map.get(str(action.token_id).strip())
         if side_signal is None and action.side is not None:
-            if action.side == Side.BUY:
-                side_signal = next((signal for signal in signal_map.values() if signal.side == Side.BUY), None)
-            elif action.side == Side.SELL:
-                side_signal = next((signal for signal in signal_map.values() if signal.side == Side.SELL), None)
+            if action.side == OutcomeSide.UP:
+                side_signal = next((signal for signal in signal_map.values() if signal.side == OutcomeSide.UP), None)
+            elif action.side == OutcomeSide.DOWN:
+                side_signal = next((signal for signal in signal_map.values() if signal.side == OutcomeSide.DOWN), None)
         record = ExecutionLogRecord(
             timestamp=utc_now(),
             market_id=market.market_id,
@@ -1709,9 +1772,9 @@ class PM1HEdgeTraderApp:
             best_ask = up_quote.best_ask
         elif down_quote is not None and str(down_quote.token_id).strip() == normalized_action_token:
             best_ask = down_quote.best_ask
-        elif action.side == Side.BUY:
+        elif action.side == OutcomeSide.UP:
             best_ask = up_quote.best_ask if up_quote is not None else None
-        elif action.side == Side.SELL:
+        elif action.side == OutcomeSide.DOWN:
             best_ask = down_quote.best_ask if down_quote is not None else None
 
         if not _should_mark_dry_run_fill(limit_price=side_signal.desired_price, best_ask=best_ask):
@@ -2303,9 +2366,9 @@ class PM1HEdgeTraderApp:
     def _has_local_market_exposure(self, market_id: str) -> bool:
         if self._open_intent_notional_for_market(market_id) > 0.0:
             return True
-        if self._market_side_exposure_tokens(market_id, Side.BUY) > 0.0:
+        if self._market_side_exposure_tokens(market_id, OutcomeSide.UP) > 0.0:
             return True
-        if self._market_side_exposure_tokens(market_id, Side.SELL) > 0.0:
+        if self._market_side_exposure_tokens(market_id, OutcomeSide.DOWN) > 0.0:
             return True
         tracker = self._paper_result_tracker
         if tracker is None:
@@ -2319,7 +2382,7 @@ class PM1HEdgeTraderApp:
             return False
         return (normalized_market_id, normalized_token_id) in self._execution_engine.active_intents()
 
-    def _apply_live_market_side_exposure(self, *, market_id: str, side: Side, delta_tokens: float) -> None:
+    def _apply_live_market_side_exposure(self, *, market_id: str, side: OutcomeSide, delta_tokens: float) -> None:
         normalized_market_id = str(market_id).strip()
         if not normalized_market_id:
             return
@@ -2330,7 +2393,7 @@ class PM1HEdgeTraderApp:
             return
         self._live_market_side_exposure_tokens[key] = next_value
 
-    def _market_side_exposure_tokens(self, market_id: str, side: Side) -> float:
+    def _market_side_exposure_tokens(self, market_id: str, side: OutcomeSide) -> float:
         normalized_market_id = str(market_id).strip()
         if not normalized_market_id:
             return 0.0
@@ -2385,6 +2448,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_market_notional=args.max_market_notional,
         max_daily_loss=args.max_daily_loss,
         max_worst_case_loss=args.max_worst_case_loss,
+        max_live_drawdown=args.max_live_drawdown,
+        live_balance_refresh_seconds=args.live_balance_refresh_seconds,
         max_entries_per_market=args.max_entries_per_market,
         rv_fallback=args.rv_fallback,
         rv_interval=args.rv_interval,
@@ -2418,6 +2483,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         position_mismatch_policy=args.position_mismatch_policy,
         position_size_threshold=args.position_size_threshold,
         position_size_relative_tolerance=args.position_size_relative_tolerance,
+        adopt_existing_positions=args.adopt_existing_positions,
+        adopt_existing_positions_policy=args.adopt_existing_positions_policy,
         hard_kill_on_daily_loss=args.hard_kill_on_daily_loss,
         enable_complete_set_arb=args.enable_complete_set_arb,
         arb_min_profit=args.arb_min_profit,
@@ -2663,15 +2730,15 @@ def _edge_for_action(
         return float(side_signal.edge)
     if decision is None or action.side is None:
         return 0.0
-    if action.side == Side.BUY:
+    if action.side == OutcomeSide.UP:
         return decision.up.edge
     return decision.down.edge
 
 
-def _side_to_label(side: Side | None) -> str:
+def _side_to_label(side: OutcomeSide | None) -> str:
     if side is None:
         return "none"
-    if side == Side.BUY:
+    if side == OutcomeSide.UP:
         return "up"
     return "down"
 

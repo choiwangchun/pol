@@ -17,8 +17,8 @@ from pm1h_edge_trader.execution import (
     IntentSignal,
     KillSwitchReason,
     LimitOrderExecutionEngine,
+    OutcomeSide,
     SafetySurface,
-    Side,
 )
 
 
@@ -51,7 +51,7 @@ class MvpValidationIntegrationTests(unittest.TestCase):
         return IntentSignal(
             market_id="mkt-1",
             token_id="token-up",
-            side=Side.BUY,
+            side=OutcomeSide.UP,
             edge=edge,
             min_edge=min_edge,
             desired_price=0.55,
@@ -193,7 +193,7 @@ class MvpValidationIntegrationTests(unittest.TestCase):
         second_signal = IntentSignal(
             market_id="mkt-1",
             token_id="token-down",
-            side=Side.SELL,
+            side=OutcomeSide.DOWN,
             edge=0.03,
             min_edge=0.01,
             desired_price=0.45,

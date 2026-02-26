@@ -16,7 +16,7 @@ from .config import (
     load_polymarket_live_auth_from_env,
     validate_live_mode_credentials,
 )
-from .execution import OrderRequest, Side
+from .execution import OrderRequest, OutcomeSide, VenueOrderSide
 from .execution.polymarket_live_adapter import PolymarketLiveExecutionAdapter
 from .feeds import BinanceUnderlyingAdapter, ClobOrderbookAdapter
 from .logger import CSVExecutionReporter, ExecutionLogRecord
@@ -205,10 +205,11 @@ async def run_once(args: argparse.Namespace) -> dict[str, object]:
     request = OrderRequest(
         market_id=market.market_id,
         token_id=token_id,
-        side=Side.BUY,
+        side=OutcomeSide.UP if direction == "up" else OutcomeSide.DOWN,
         price=price,
         size=size,
         submitted_at=now,
+        order_side=VenueOrderSide.BUY,
     )
     handle = adapter.place_limit_order(request)
     live_record = ExecutionLogRecord(

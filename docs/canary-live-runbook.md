@@ -32,6 +32,13 @@ scripts/canary_stage1_tiny_live.sh
 1. 체결 로그(`live_fill`)가 누적됨
 2. `logs/result.json`의 `unsettled_notional`, `available_bankroll`이 정상
 3. 손실 한도 도달 시 hard kill 작동
+4. `MAX_LIVE_DRAWDOWN=1 scripts/canary_stage1_tiny_live.sh`로 `live_drawdown_limit` kill 재현 가능
+5. `MAX_MARKET_NOTIONAL=1`로 market notional 제한 동작 재현 가능
+
+Kill 발생 후 운영자 조치:
+1. `scripts/emergency_stop.sh` 실행
+2. open orders가 0인지 확인
+3. `logs/app.log`에서 kill reason 확인 후 원인 제거 전 재가동 금지
 
 ## Emergency Stop
 
