@@ -99,7 +99,6 @@ Safety + Recon + Arb 옵션(기본은 안전/옵트인):
 --arb-fill-timeout-seconds 15
 ```
 
-- `kill-switch reason` 확장: `daily_loss_limit`, `bankroll_depleted`, `market_notional_limit_breach`, `worst_case_loss_limit`, `position_mismatch`
 - `kill-switch reason` 확장: `daily_loss_limit`, `bankroll_depleted`, `market_notional_limit_breach`, `worst_case_loss_limit`, `live_drawdown_limit`, `position_mismatch`
 - 포지션 리컨실은 Live 지갑 포지션(Data API `/positions`)과 로컬 노출을 비교합니다.
 - `--max-daily-loss`는 settled(실현손익) 기준 보호입니다. Live 운영 중 즉시 보호는 `--max-live-drawdown`으로 추가할 수 있습니다.
@@ -148,7 +147,7 @@ PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
 승률/손익 집계 예시:
 
 ```bash
-PYTHONPATH=src python - <<'PY'
+PYTHONPATH=src uv run --python 3.11 python - <<'PY'
 from pm1h_edge_trader.logger import summarize_csv
 
 initial_bankroll = 500.0
@@ -178,6 +177,8 @@ uv run --python 3.11 python -m unittest discover -s tests -p "test_*.py" -v
 ```bash
 scripts/canary_stage0_no_trade.sh
 scripts/canary_stage1_tiny_live.sh
+# drawdown kill 재현(의도적으로 낮은 임계치):
+MAX_LIVE_DRAWDOWN=1 scripts/canary_stage1_tiny_live.sh
 ```
 
 ## Electron GUI
