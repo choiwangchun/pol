@@ -181,6 +181,44 @@ class PolicyBanditController:
         self._dataset.reset()
         self._save_state()
 
+    def export_state(self) -> dict[str, object]:
+        contexts: dict[str, dict[str, dict[str, float | int]]] = {}
+        for context_id, profile_map in self._stats.items():
+            serialized: dict[str, dict[str, float | int]] = {}
+            for profile_id, stats in profile_map.items():
+                serialized[profile_id] = {
+                    "count": stats.count,
+                    "total_reward": stats.total_reward,
+                    "mean_reward": stats.mean_reward,
+                }
+            contexts[context_id] = serialized
+        return {
+            "updated_at": datetime.utcnow().isoformat(),
+            "contexts": contexts,
+        }
+
+    def import_state(self, payload: dict[str, object]) -> None:
+        contexts = payload.get("contexts")
+        if not isinstance(contexts, dict):
+            return
+        self._stats = {}
+        for context_id, profile_map in contexts.items():
+            if not isinstance(profile_map, dict):
+                continue
+            typed_map: dict[str, _BanditArmStats] = {}
+            for profile_id, raw in profile_map.items():
+                if not isinstance(raw, dict):
+                    continue
+                count = raw.get("count")
+                total_reward = raw.get("total_reward")
+                if not isinstance(count, int):
+                    continue
+                if not isinstance(total_reward, (float, int)):
+                    continue
+                typed_map[profile_id] = _BanditArmStats(count=count, total_reward=float(total_reward))
+            if typed_map:
+                self._stats[str(context_id)] = typed_map
+
     def select_profile(
         self,
         *,
@@ -401,41 +439,11 @@ class PolicyBanditController:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        contexts = payload.get("contexts")
-        if not isinstance(contexts, dict):
-            return
-        for context_id, profile_map in contexts.items():
-            if not isinstance(profile_map, dict):
-                continue
-            typed_map: dict[str, _BanditArmStats] = {}
-            for profile_id, raw in profile_map.items():
-                if not isinstance(raw, dict):
-                    continue
-                count = raw.get("count")
-                total_reward = raw.get("total_reward")
-                if not isinstance(count, int):
-                    continue
-                if not isinstance(total_reward, (float, int)):
-                    continue
-                typed_map[profile_id] = _BanditArmStats(count=count, total_reward=float(total_reward))
-            if typed_map:
-                self._stats[str(context_id)] = typed_map
+        if isinstance(payload, dict):
+            self.import_state(payload)
 
     def _save_state(self) -> None:
-        contexts: dict[str, dict[str, dict[str, float | int]]] = {}
-        for context_id, profile_map in self._stats.items():
-            serialized: dict[str, dict[str, float | int]] = {}
-            for profile_id, stats in profile_map.items():
-                serialized[profile_id] = {
-                    "count": stats.count,
-                    "total_reward": stats.total_reward,
-                    "mean_reward": stats.mean_reward,
-                }
-            contexts[context_id] = serialized
-        payload = {
-            "updated_at": datetime.utcnow().isoformat(),
-            "contexts": contexts,
-        }
+        payload = self.export_state()
         path = self._config.state_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")

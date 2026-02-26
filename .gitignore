@@ -5,6 +5,7 @@
 
 # Runtime logs and local outputs
 logs/
+state/
 *.log
 
 # Python cache and tooling

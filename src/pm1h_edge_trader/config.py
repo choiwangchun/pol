@@ -87,6 +87,7 @@ class DecisionConfig:
 class PolicyConfig:
     enabled: bool = False
     shadow_mode: bool = False
+    mode: str = "shadow"
     exploration_epsilon: float = 0.05
     ucb_c: float = 1.0
     reward_turnover_lambda: float = 0.0
@@ -182,6 +183,15 @@ class LoggingConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class RuntimeStateConfig:
+    resume: bool = True
+    state_dir: Path = Path("state")
+    checkpoint_interval_seconds: float = 45.0
+    require_manual_unlatch: bool = True
+    manual_unlatch: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class AppConfig:
     mode: RuntimeMode = RuntimeMode.DRY_RUN
     fresh_start: bool = False
@@ -198,6 +208,7 @@ class AppConfig:
     loop: LoopConfig = field(default_factory=LoopConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    runtime_state: RuntimeStateConfig = field(default_factory=RuntimeStateConfig)
 
     @property
     def is_dry_run(self) -> bool:
@@ -268,6 +279,12 @@ def build_config(
     cancel_orphan_orders: bool = False,
     fresh_start: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
+    resume: bool = True,
+    state_dir: Path | None = None,
+    runtime_checkpoint_interval_seconds: float = 45.0,
+    require_manual_unlatch: bool = True,
+    manual_unlatch: bool = False,
+    policy_mode: str = "shadow",
 ) -> AppConfig:
     """Constructs an app config from CLI inputs."""
     market_notional_cap = max_market_notional
@@ -285,6 +302,9 @@ def build_config(
     normalized_adopt_policy = str(adopt_existing_positions_policy).strip().lower() or "block"
     if normalized_adopt_policy not in {"kill", "block", "warn"}:
         normalized_adopt_policy = "block"
+    normalized_policy_mode = str(policy_mode).strip().lower() or "shadow"
+    if normalized_policy_mode not in {"shadow", "apply_calibrator", "apply_calibrator_cost", "full"}:
+        normalized_policy_mode = "shadow"
     entry_limit = max(1, max_entries_per_market)
     if enable_complete_set_arb:
         entry_limit = max(entry_limit, 2)
@@ -320,6 +340,7 @@ def build_config(
         policy=PolicyConfig(
             enabled=enable_policy_bandit,
             shadow_mode=policy_shadow_mode,
+            mode=normalized_policy_mode,
             exploration_epsilon=min(1.0, max(0.0, policy_exploration_epsilon or 0.05)),
             ucb_c=max(0.0, policy_ucb_c or 1.0),
             reward_turnover_lambda=max(0.0, policy_reward_turnover_lambda or 0.0),
@@ -373,6 +394,13 @@ def build_config(
             hard_kill_on_daily_loss=hard_kill_on_daily_loss,
         ),
         logging=LoggingConfig(root_dir=log_dir),
+        runtime_state=RuntimeStateConfig(
+            resume=bool(resume),
+            state_dir=Path(state_dir) if state_dir is not None else Path("state"),
+            checkpoint_interval_seconds=max(5.0, runtime_checkpoint_interval_seconds),
+            require_manual_unlatch=bool(require_manual_unlatch),
+            manual_unlatch=bool(manual_unlatch),
+        ),
     )
 
 

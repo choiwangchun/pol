@@ -24,6 +24,7 @@ from .config import (
 from .engine import DecisionConfig as ProbabilityDecisionConfig
 from .engine import DecisionEngine as ProbabilityDecisionEngine
 from .engine import DecisionOutcome
+from .engine import TradeIntent, fractional_kelly
 from .execution import (
     ActiveIntent,
     DryRunExecutionAdapter,
@@ -37,6 +38,7 @@ from .execution import (
     PolymarketLiveExecutionAdapter,
     SafetySurface,
     VenueOrderSide,
+    parse_outcome_side,
 )
 from .feeds import BinanceUnderlyingAdapter, ClobOrderbookAdapter
 from .feeds.http_client import AsyncJsonHttpClient
@@ -46,14 +48,23 @@ from .live_balance import LiveBalanceSnapshot, fetch_live_balance_snapshot
 from .live_claim import LiveAutoClaimWorker, build_live_auto_claim_worker
 from .markets import FeeRateGuardClient, GammaMarketDiscoveryClient, MarketCandidate
 from .paper import PaperResultTracker, PaperSettlementCoordinator, PolymarketMarketResolutionResolver
-from .policy import PolicyBanditConfig, PolicyBanditController, PolicySelection
+from .policy import (
+    OnlineCostEstimator,
+    OnlineLogisticCalibrator,
+    PolicyBanditConfig,
+    PolicyBanditController,
+    PolicySelection,
+    build_calibrator_features,
+)
 from .positions import DataApiPositionsClient, evaluate_position_mismatch, extract_position_snapshot
+from .runtime import RuntimeStateManager
 from .risk import CircuitBreakerSnapshot, LiveBalanceMonitor, evaluate_circuit_breaker
 from .strategy import CompleteSetArbDecision, decide_complete_set_arb
 
 LOGGER = logging.getLogger("pm1h_edge_trader")
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 LIVE_RECON_MAX_RETRIES = 3
+RUNTIME_STATE_VERSION = 1
 
 
 def utc_now() -> datetime:
@@ -274,6 +285,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.03,
         help="Max spread considered tight for context bucketing.",
+    )
+    parser.add_argument(
+        "--policy-mode",
+        choices=["shadow", "apply_calibrator", "apply_calibrator_cost", "full"],
+        default="shadow",
+        help="EPL policy application mode.",
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from state checkpoint on startup.",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=Path("state"),
+        help="Directory containing runtime/policy checkpoint files.",
+    )
+    parser.add_argument(
+        "--require-manual-unlatch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep restored kill-switch latch unless --manual-unlatch is provided.",
+    )
+    parser.add_argument(
+        "--manual-unlatch",
+        action="store_true",
+        help="Explicitly clear restored kill-switch latch at startup.",
     )
     parser.add_argument(
         "--disable-auto-claim",
@@ -697,11 +737,13 @@ class PM1HEdgeTraderApp:
                 cap=config.volatility.deribit_iv_cap,
             )
         self._policy_controller: PolicyBanditController | None = None
-        if config.policy.enabled:
+        bandit_enabled = config.policy.enabled or config.policy.mode in {"shadow", "full"}
+        bandit_shadow_mode = config.policy.shadow_mode or config.policy.mode != "full"
+        if bandit_enabled:
             self._policy_controller = PolicyBanditController(
                 config=PolicyBanditConfig(
-                    enabled=config.policy.enabled,
-                    shadow_mode=config.policy.shadow_mode,
+                    enabled=bandit_enabled,
+                    shadow_mode=bandit_shadow_mode,
                     exploration_epsilon=config.policy.exploration_epsilon,
                     ucb_c=config.policy.ucb_c,
                     reward_turnover_lambda=config.policy.reward_turnover_lambda,
@@ -709,11 +751,19 @@ class PM1HEdgeTraderApp:
                     vol_ratio_threshold=config.policy.vol_ratio_threshold,
                     spread_tight_threshold=config.policy.spread_tight_threshold,
                     dataset_path=config.logging.root_dir / config.policy.dataset_csv_name,
-                    state_path=config.logging.root_dir / config.policy.state_json_name,
+                    state_path=config.runtime_state.state_dir / config.policy.state_json_name,
                 ),
                 base_decision_config=self._base_decision_config,
             )
         self._latest_policy_selection: PolicySelection | None = None
+        self._policy_mode = config.policy.mode
+        self._state_manager = RuntimeStateManager(state_dir=config.runtime_state.state_dir)
+        self._calibrator = OnlineLogisticCalibrator(learning_rate=1e-3, l2=1e-4, max_weight_norm=5.0)
+        self._cost_estimator = OnlineCostEstimator(alpha=0.05, decay=0.999, min_cost=0.0, max_cost=0.25)
+        self._freeze_learning = False
+        self._processed_settle_market_ids: set[str] = set()
+        self._next_runtime_checkpoint_at: datetime | None = None
+        self._active_decision_config = self._base_decision_config
 
         self._market: MarketCandidate | None = None
         self._orderbook: ClobOrderbookAdapter | None = None
@@ -816,6 +866,8 @@ class PM1HEdgeTraderApp:
             await self._deactivate_market()
 
     async def _bootstrap_runtime(self) -> None:
+        if self._config.runtime_state.resume:
+            self._load_checkpoint_state()
         if self._paper_result_tracker is not None:
             if self._config.fresh_start:
                 LOGGER.info("fresh_start enabled: ignoring previous executions.csv state")
@@ -825,6 +877,9 @@ class PM1HEdgeTraderApp:
                     self._policy_controller.reset()
             else:
                 self._paper_result_tracker.bootstrap_from_csv(self._config.logging.execution_csv_path)
+        if self._next_runtime_checkpoint_at is None:
+            interval = max(5.0, self._config.runtime_state.checkpoint_interval_seconds)
+            self._next_runtime_checkpoint_at = utc_now() + timedelta(seconds=interval)
 
     async def _initialize(self) -> None:
         await self._bootstrap_runtime()
@@ -924,7 +979,165 @@ class PM1HEdgeTraderApp:
         self._arb_one_leg_started_at = None
         self._live_order_matched_sizes = {}
         self._live_market_side_exposure_tokens = {}
+        self._active_decision_config = self._base_decision_config
         self._market = None
+
+    def _load_checkpoint_state(self) -> None:
+        runtime_payload = self._state_manager.load_runtime()
+        policy_payload = self._state_manager.load_policy()
+
+        if runtime_payload:
+            version = int(runtime_payload.get("state_version", 0))
+            if version != RUNTIME_STATE_VERSION:
+                self._freeze_learning = True
+                self._external_kill_switch_latched = True
+                return
+
+            matched = runtime_payload.get("order_last_matched_size")
+            if isinstance(matched, Mapping):
+                restored: dict[str, float] = {}
+                for order_id, value in matched.items():
+                    key = str(order_id).strip()
+                    if not key:
+                        continue
+                    if isinstance(value, (int, float)):
+                        restored[key] = max(0.0, float(value))
+                self._live_order_matched_sizes = restored
+
+            exposure_map = runtime_payload.get("live_market_side_exposure_tokens")
+            if isinstance(exposure_map, Mapping):
+                restored_exposure: dict[tuple[str, OutcomeSide], float] = {}
+                for key, value in exposure_map.items():
+                    if not isinstance(value, (int, float)):
+                        continue
+                    market_side = str(key).split("|", 1)
+                    if len(market_side) != 2:
+                        continue
+                    market_id = market_side[0].strip()
+                    side = parse_outcome_side(market_side[1])
+                    if not market_id or side is None:
+                        continue
+                    restored_exposure[(market_id, side)] = max(0.0, float(value))
+                self._live_market_side_exposure_tokens = restored_exposure
+
+            latched = bool(runtime_payload.get("kill_switch_latched"))
+            requires_manual = self._config.runtime_state.require_manual_unlatch
+            manual_unlatch = self._config.runtime_state.manual_unlatch
+            if latched and (not requires_manual or not manual_unlatch):
+                self._external_kill_switch_latched = True
+                reason = _parse_kill_reason(runtime_payload.get("kill_reason"))
+                try:
+                    self._execution_engine.latch_kill_switch(reason=reason, now=utc_now())
+                except Exception:
+                    # Keep external latch even if local re-latch fails.
+                    pass
+            elif manual_unlatch:
+                self._external_kill_switch_latched = False
+
+        if policy_payload:
+            freeze_learning = policy_payload.get("freeze_learning")
+            if isinstance(freeze_learning, bool):
+                self._freeze_learning = freeze_learning
+
+            calibrator_payload = policy_payload.get("calibrator")
+            if isinstance(calibrator_payload, dict):
+                self._calibrator.import_state(calibrator_payload)
+
+            cost_payload = policy_payload.get("cost_estimator")
+            if isinstance(cost_payload, dict):
+                self._cost_estimator.import_state(cost_payload)
+
+            processed = policy_payload.get("processed_settle_market_ids")
+            if isinstance(processed, list):
+                self._processed_settle_market_ids = {
+                    str(item).strip() for item in processed if str(item).strip()
+                }
+
+            bandit_payload = policy_payload.get("bandit")
+            if isinstance(bandit_payload, dict) and self._policy_controller is not None:
+                import_state = getattr(self._policy_controller, "import_state", None)
+                if callable(import_state):
+                    import_state(bandit_payload)
+
+        if self._config.runtime_state.manual_unlatch:
+            self._external_kill_switch_latched = False
+            self._freeze_learning = False
+            self._execution_engine.reset_kill_switch()
+
+    def _save_checkpoint_state(self, *, now: datetime) -> None:
+        market = self._market
+        intents: dict[str, dict[str, object]] = {}
+        for active in self._execution_engine.active_intents().values():
+            intents[active.order_id] = {
+                "order_id": active.order_id,
+                "market_id": active.market_id,
+                "token_id": active.token_id,
+                "side": active.side.value,
+                "price": active.price,
+                "size": active.size,
+                "created_at": active.created_at.isoformat(),
+                "last_requote_at": active.last_quoted_at.isoformat(),
+            }
+
+        runtime_payload: dict[str, object] = {
+            "state_version": RUNTIME_STATE_VERSION,
+            "saved_at": now.isoformat(),
+            "last_seen_market_id": market.market_id if market is not None else None,
+            "up_token_id": market.token_ids.up_token_id if market is not None else None,
+            "down_token_id": market.token_ids.down_token_id if market is not None else None,
+            "active_intents": intents,
+            "kill_switch_latched": self._external_kill_switch_latched or self._execution_engine.kill_switch.active,
+            "kill_reason": _first_kill_reason(self._execution_engine.kill_switch.reasons),
+            "entry_block_reason": (
+                self._entry_block_reason(now=now, market_id=market.market_id)
+                if market is not None
+                else None
+            ),
+            "order_last_matched_size": dict(self._live_order_matched_sizes),
+            "processed_trade_ids": [],
+            "day_id": _seoul_day_id(now),
+            "daily_realized_pnl": self._daily_realized_pnl(now),
+            "live_balance_baseline": _live_balance_baseline_value(self._live_balance_monitor),
+            "last_balance_snapshot": None,
+            "live_market_side_exposure_tokens": {
+                f"{market_id}|{side.value}": value
+                for (market_id, side), value in self._live_market_side_exposure_tokens.items()
+            },
+        }
+
+        bandit_state: dict[str, object] | None = None
+        if self._policy_controller is not None:
+            export_state = getattr(self._policy_controller, "export_state", None)
+            if callable(export_state):
+                raw = export_state()
+                if isinstance(raw, dict):
+                    bandit_state = raw
+
+        policy_payload: dict[str, object] = {
+            "state_version": RUNTIME_STATE_VERSION,
+            "saved_at": now.isoformat(),
+            "freeze_learning": self._freeze_learning,
+            "calibrator": self._calibrator.export_state(),
+            "cost_estimator": self._cost_estimator.export_state(),
+            "processed_settle_market_ids": sorted(self._processed_settle_market_ids),
+        }
+        if bandit_state is not None:
+            policy_payload["bandit"] = bandit_state
+
+        self._state_manager.save_runtime(runtime_payload)
+        self._state_manager.save_policy(policy_payload)
+
+    def _maybe_checkpoint_state(self, *, now: datetime, force: bool = False) -> None:
+        if not self._config.runtime_state.resume:
+            return
+        if not force and self._next_runtime_checkpoint_at is not None and now < self._next_runtime_checkpoint_at:
+            return
+        try:
+            self._save_checkpoint_state(now=now)
+        except Exception as exc:
+            LOGGER.warning("checkpoint_save_failed error=%s", exc)
+        interval = max(5.0, self._config.runtime_state.checkpoint_interval_seconds)
+        self._next_runtime_checkpoint_at = now + timedelta(seconds=interval)
 
     async def _tick_once(self, *, tick_count: int) -> bool:
         market = self._require_market()
@@ -961,10 +1174,15 @@ class PM1HEdgeTraderApp:
         rv_long = sigma
         rv_short = sigma
         dynamic_iv: float | None = self._config.volatility.iv_override
+        q_model_up = 0.5
+        q_cal_up = 0.5
+        cost_dynamic = 0.0
         selected_profile_id = "P2_BALANCED"
         applied_profile_id = "P2_BALANCED"
         self._latest_policy_selection = None
+        self._active_decision_config = self._base_decision_config
         decision_bankroll = self._decision_bankroll()
+        self._refresh_freeze_state()
         entry_block_reason = self._entry_block_reason(now=now, market_id=market.market_id)
         circuit_breaker = evaluate_circuit_breaker(
             CircuitBreakerSnapshot(
@@ -1028,6 +1246,7 @@ class PM1HEdgeTraderApp:
                 decision_engine = ProbabilityDecisionEngine(
                     self._policy_controller.decision_config_for(applied_profile_id)
                 )
+            self._active_decision_config = decision_engine.config
             decision = decision_engine.decide(
                 spot=underlying.last_price or 0.0,
                 strike=underlying.candle_open or 0.0,
@@ -1036,6 +1255,16 @@ class PM1HEdgeTraderApp:
                 iv=dynamic_iv,
                 ask_up=up_quote.best_ask or 0.0,
                 ask_down=down_quote.best_ask or 0.0,
+                bankroll=decision_bankroll,
+            )
+            q_model_up = decision.q_up
+            decision, q_cal_up, cost_dynamic = self._apply_evolution_policy_layers(
+                decision=decision,
+                rv_long=rv_long,
+                rv_short=rv_short,
+                seconds_to_expiry=seconds_to_expiry,
+                up_quote=up_quote,
+                down_quote=down_quote,
                 bankroll=decision_bankroll,
             )
             sigma = decision.sigma
@@ -1147,6 +1376,7 @@ class PM1HEdgeTraderApp:
             arb_decision=arb_decision,
         )
         await self._reconcile_paper_settlements(now=now)
+        self._maybe_checkpoint_state(now=now)
         return False
 
     def _ensure_live_auto_claim_worker(self) -> LiveAutoClaimWorker | None:
@@ -1585,7 +1815,7 @@ class PM1HEdgeTraderApp:
                 token_id=quote.token_id if quote is not None else token_id,
                 side=side,
                 edge=0.0,
-                min_edge=self._config.decision.edge_min,
+                min_edge=self._active_decision_config.edge_min,
                 desired_price=None,
                 size=0.0,
                 seconds_to_expiry=max(seconds_to_expiry, 0.0),
@@ -1596,9 +1826,9 @@ class PM1HEdgeTraderApp:
 
         side_intent = decision.up if side_label == "up" else decision.down
         edge_buffer = (
-            self._config.decision.edge_buffer_up
+            self._active_decision_config.edge_buffer_up
             if side_label == "up"
-            else self._config.decision.edge_buffer_down
+            else self._active_decision_config.edge_buffer_down
         )
         desired_price = _limit_price(
             ask=quote.best_ask,
@@ -1619,7 +1849,7 @@ class PM1HEdgeTraderApp:
             token_id=quote.token_id,
             side=side,
             edge=side_intent.edge,
-            min_edge=self._config.decision.edge_min,
+            min_edge=self._active_decision_config.edge_min,
             desired_price=desired_price,
             size=share_size,
             seconds_to_expiry=max(seconds_to_expiry, 0.0),
@@ -1747,6 +1977,22 @@ class PM1HEdgeTraderApp:
                     paper_fill_record,
                     selection=self._latest_policy_selection,
                 )
+            spread = max(
+                max((up_quote.best_ask or 0.0) - (up_quote.best_bid or 0.0), 0.0) if up_quote is not None else 0.0,
+                max((down_quote.best_ask or 0.0) - (down_quote.best_bid or 0.0), 0.0)
+                if down_quote is not None
+                else 0.0,
+            )
+            decision_price = side_signal.desired_price if side_signal is not None and side_signal.desired_price is not None else paper_fill_record.price
+            self._cost_estimator.update(
+                decision_price=decision_price,
+                fill_price=paper_fill_record.price,
+                spread=spread,
+                matched_size=paper_fill_record.size,
+                ts=paper_fill_record.timestamp,
+                freeze=self._freeze_learning,
+            )
+            self._maybe_checkpoint_state(now=paper_fill_record.timestamp, force=True)
 
     def _build_paper_fill_record(
         self,
@@ -1817,6 +2063,11 @@ class PM1HEdgeTraderApp:
             for record in appended_records:
                 if self._paper_result_tracker is not None:
                     self._paper_result_tracker.on_record(record)
+                normalized_market_id = str(record.market_id).strip()
+                if normalized_market_id and normalized_market_id in self._processed_settle_market_ids:
+                    continue
+
+                self._update_calibrator_from_settlement(record)
                 if self._policy_controller is not None:
                     reward = self._policy_controller.on_settlement(
                         record,
@@ -1827,13 +2078,193 @@ class PM1HEdgeTraderApp:
                     )
                     if reward is not None:
                         LOGGER.info("policy_reward order_id=%s reward=%.8f", record.order_id, reward)
+
+                if normalized_market_id:
+                    self._processed_settle_market_ids.add(normalized_market_id)
             appended = len(appended_records)
             if appended > 0:
                 LOGGER.info("paper_settle_appended=%s", appended)
+                self._maybe_checkpoint_state(now=now_ts, force=True)
         except Exception as exc:
             LOGGER.warning("Paper settlement reconciliation failed: %s", exc)
         finally:
             self._next_paper_settlement_check = now_ts + self._paper_settlement_interval
+
+    def _update_calibrator_from_settlement(self, record: ExecutionLogRecord) -> None:
+        label_up = _settlement_label_up(record)
+        if label_up is None:
+            return
+        spread = max(
+            max(record.ask_up - record.bid_up, 0.0),
+            max(record.ask_down - record.bid_down, 0.0),
+        )
+        tau_seconds = max(0.0, record.tau * SECONDS_PER_YEAR)
+        features = build_calibrator_features(
+            q_model_up=record.q_up,
+            spread=spread,
+            rv_long=max(record.sigma, 1e-9),
+            rv_short=max(record.sigma, 1e-9),
+            tte_seconds=tau_seconds,
+        )
+        self._calibrator.update(
+            features=features,
+            label_up=label_up,
+            freeze=self._freeze_learning,
+        )
+
+    def _refresh_freeze_state(self) -> None:
+        self._freeze_learning = (
+            self._freeze_learning
+            or self._external_kill_switch_latched
+            or self._execution_engine.kill_switch.active
+            or self._position_mismatch_blocked
+        )
+
+    def _apply_evolution_policy_layers(
+        self,
+        *,
+        decision: DecisionOutcome,
+        rv_long: float,
+        rv_short: float,
+        seconds_to_expiry: float,
+        up_quote: BestQuote | None,
+        down_quote: BestQuote | None,
+        bankroll: float,
+    ) -> tuple[DecisionOutcome, float, float]:
+        spread = max(
+            max((up_quote.best_ask or 0.0) - (up_quote.best_bid or 0.0), 0.0) if up_quote is not None else 0.0,
+            max((down_quote.best_ask or 0.0) - (down_quote.best_bid or 0.0), 0.0)
+            if down_quote is not None
+            else 0.0,
+        )
+        features = build_calibrator_features(
+            q_model_up=decision.q_up,
+            spread=spread,
+            rv_long=max(rv_long, 1e-9),
+            rv_short=max(rv_short, 1e-9),
+            tte_seconds=max(0.0, seconds_to_expiry),
+        )
+        q_cal_up = self._calibrator.predict(features)
+        mode = self._policy_mode
+        apply_calibrator = mode in {"apply_calibrator", "apply_calibrator_cost", "full"}
+        apply_cost = mode in {"apply_calibrator_cost", "full"}
+        q_used_up = q_cal_up if apply_calibrator else decision.q_up
+        q_used_down = 1.0 - q_used_up
+        dynamic_cost = self._cost_estimator.get() if apply_cost else 0.0
+
+        if (
+            (not apply_calibrator)
+            and dynamic_cost <= 0.0
+            and abs(q_used_up - decision.q_up) <= 1e-12
+        ):
+            return decision, q_cal_up, dynamic_cost
+        if up_quote is None or down_quote is None or up_quote.best_ask is None or down_quote.best_ask is None:
+            return decision, q_cal_up, dynamic_cost
+
+        adjusted = self._rebuild_decision_from_adjusted_probabilities(
+            q_up=q_used_up,
+            q_down=q_used_down,
+            ask_up=up_quote.best_ask,
+            ask_down=down_quote.best_ask,
+            bankroll=bankroll,
+            sigma=decision.sigma,
+            dynamic_cost=dynamic_cost,
+        )
+        return adjusted, q_cal_up, dynamic_cost
+
+    def _rebuild_decision_from_adjusted_probabilities(
+        self,
+        *,
+        q_up: float,
+        q_down: float,
+        ask_up: float,
+        ask_down: float,
+        bankroll: float,
+        sigma: float,
+        dynamic_cost: float,
+    ) -> DecisionOutcome:
+        config = self._active_decision_config
+        edge_up = q_up - ask_up - config.cost_rate_up - dynamic_cost
+        edge_down = q_down - ask_down - config.cost_rate_down - dynamic_cost
+        edge_after_up = edge_up - config.edge_buffer_up
+        edge_after_down = edge_down - config.edge_buffer_down
+
+        up_intent = self._build_trade_intent_from_values(
+            side="up",
+            probability=q_up,
+            ask=ask_up,
+            edge=edge_up,
+            edge_after_buffer=edge_after_up,
+            bankroll=bankroll,
+            config=config,
+        )
+        down_intent = self._build_trade_intent_from_values(
+            side="down",
+            probability=q_down,
+            ask=ask_down,
+            edge=edge_down,
+            edge_after_buffer=edge_after_down,
+            bankroll=bankroll,
+            config=config,
+        )
+        return DecisionOutcome(
+            sigma=sigma,
+            q_up=q_up,
+            q_down=q_down,
+            up=up_intent,
+            down=down_intent,
+        )
+
+    def _build_trade_intent_from_values(
+        self,
+        *,
+        side: str,
+        probability: float,
+        ask: float,
+        edge: float,
+        edge_after_buffer: float,
+        bankroll: float,
+        config: ProbabilityDecisionConfig,
+    ) -> TradeIntent:
+        kelly_f = fractional_kelly(
+            q=probability,
+            c=ask,
+            kelly_fraction=config.kelly_fraction,
+            f_cap=config.f_cap,
+        )
+        order_size = bankroll * kelly_f
+        should_trade = (
+            bankroll > 0.0
+            and edge_after_buffer >= config.edge_min
+            and kelly_f > 0.0
+            and order_size >= config.min_order_size
+        )
+        if should_trade:
+            reason = "trade"
+        elif bankroll <= 0.0:
+            reason = "bankroll_non_positive"
+            order_size = 0.0
+        elif edge_after_buffer < config.edge_min:
+            reason = "edge_below_min"
+            order_size = 0.0
+        elif kelly_f <= 0.0:
+            reason = "kelly_zero"
+            order_size = 0.0
+        else:
+            reason = "below_min_order_size"
+            order_size = 0.0
+
+        return TradeIntent(
+            side="up" if side == "up" else "down",
+            should_trade=should_trade,
+            probability=probability,
+            ask=ask,
+            edge=edge,
+            edge_after_buffer=edge_after_buffer,
+            kelly_fraction=kelly_f,
+            order_size=order_size,
+            reason=reason,
+        )
 
     def _log_tick_summary(
         self,
@@ -2232,6 +2663,15 @@ class PM1HEdgeTraderApp:
             side=intent.side,
             delta_tokens=delta_size * direction,
         )
+        self._cost_estimator.update(
+            decision_price=intent.price,
+            fill_price=fill_price,
+            spread=0.0,
+            matched_size=delta_size,
+            ts=now,
+            freeze=self._freeze_learning,
+        )
+        self._maybe_checkpoint_state(now=now, force=True)
 
     def _enforce_near_expiry_cleanup(
         self,
@@ -2281,12 +2721,14 @@ class PM1HEdgeTraderApp:
         if self._external_kill_switch_latched:
             return
         self._external_kill_switch_latched = True
+        self._freeze_learning = True
         try:
             self._execution_engine.latch_kill_switch(reason=reason, now=now)
         except Exception as exc:
             LOGGER.warning("kill_switch_latch_local_cancel_failed: %s", exc)
         if cancel_venue_orders:
             self._cancel_all_venue_orders(now=now)
+        self._maybe_checkpoint_state(now=now, force=True)
         LOGGER.error("%s: kill switch latched.", message)
 
     def _decision_bankroll(self) -> float:
@@ -2304,6 +2746,8 @@ class PM1HEdgeTraderApp:
             return "external_kill_switch_latched"
         if self._position_mismatch_blocked:
             return "position_mismatch"
+        if self._freeze_learning:
+            return "learning_frozen"
 
         tracker = self._paper_result_tracker
         if tracker is None:
@@ -2398,6 +2842,50 @@ class PM1HEdgeTraderApp:
         if not normalized_market_id:
             return 0.0
         return max(0.0, self._live_market_side_exposure_tokens.get((normalized_market_id, side), 0.0))
+
+
+def _parse_kill_reason(value: object) -> KillSwitchReason:
+    text = str(value).strip().lower()
+    for reason in KillSwitchReason:
+        if text == reason.value:
+            return reason
+    return KillSwitchReason.ORDER_RECONCILIATION_FAILED
+
+
+def _first_kill_reason(reasons: Sequence[KillSwitchReason]) -> str | None:
+    for reason in reasons:
+        return reason.value
+    return None
+
+
+def _seoul_day_id(now: datetime) -> str:
+    seoul_tz = timezone(timedelta(hours=9))
+    return now.astimezone(seoul_tz).date().isoformat()
+
+
+def _live_balance_baseline_value(monitor: LiveBalanceMonitor | None) -> float | None:
+    if monitor is None:
+        return None
+    baseline = getattr(monitor, "_baseline", None)
+    bankroll = getattr(baseline, "bankroll", None)
+    if isinstance(bankroll, (int, float)):
+        return float(bankroll)
+    return None
+
+
+def _settlement_label_up(record: ExecutionLogRecord) -> float | None:
+    side = str(record.side or "").strip().lower()
+    outcome = str(record.settlement_outcome or "").strip().lower()
+    if outcome not in {"win", "loss"}:
+        pnl = float(record.pnl) if record.pnl is not None else 0.0
+        if abs(pnl) <= 1e-12:
+            return None
+        outcome = "win" if pnl > 0.0 else "loss"
+    if side not in {"up", "down"}:
+        return None
+    if outcome == "win":
+        return 1.0 if side == "up" else 0.0
+    return 0.0 if side == "up" else 1.0
 
 
 def install_signal_handlers(stop_event: asyncio.Event) -> None:
@@ -2495,6 +2983,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         enable_websocket=not args.disable_websocket,
         fresh_start=args.fresh_start,
         polymarket_live_auth=live_auth,
+        resume=args.resume,
+        state_dir=args.state_dir,
+        require_manual_unlatch=args.require_manual_unlatch,
+        manual_unlatch=args.manual_unlatch,
+        policy_mode=args.policy_mode,
     )
     configure_logging(config)
     if live_balance is not None:
