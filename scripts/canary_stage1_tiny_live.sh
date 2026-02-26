@@ -11,6 +11,8 @@ MAX_LIVE_DRAWDOWN="${MAX_LIVE_DRAWDOWN:-2}"
 
 PYTHONPATH=src uv run --python 3.11 python -m pm1h_edge_trader.main \
   --mode live \
+  --resume \
+  --state-dir state \
   --max-market-notional "${MAX_MARKET_NOTIONAL}" \
   --max-daily-loss "${MAX_DAILY_LOSS}" \
   --max-live-drawdown "${MAX_LIVE_DRAWDOWN}" \
