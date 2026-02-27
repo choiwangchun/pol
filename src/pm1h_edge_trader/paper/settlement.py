@@ -51,7 +51,7 @@ class _PaperFill:
 
 
 class PaperSettlementCoordinator:
-    """Reconciles unresolved paper fills into settlement records."""
+    """Reconciles unresolved fill records into settlement records."""
 
     def __init__(
         self,
@@ -60,11 +60,16 @@ class PaperSettlementCoordinator:
         reporter: _ExecutionReporter,
         resolver: MarketResolutionResolver,
         now_fn=utc_now,
+        fill_statuses: tuple[str, ...] = ("paper_fill",),
+        settle_statuses: tuple[str, ...] = ("paper_settle",),
     ) -> None:
         self._execution_csv_path = Path(execution_csv_path)
         self._reporter = reporter
         self._resolver = resolver
         self._now_fn = now_fn
+        self._fill_statuses = _normalize_status_set(fill_statuses, fallback=("paper_fill",))
+        self._settle_statuses = _normalize_status_set(settle_statuses, fallback=("paper_settle",))
+        self._output_settle_status = next(iter(sorted(self._settle_statuses)))
 
     async def reconcile(self) -> int:
         records = await self.reconcile_records()
@@ -72,7 +77,11 @@ class PaperSettlementCoordinator:
 
     async def reconcile_records(self) -> list[ExecutionLogRecord]:
         rows = _read_csv_rows(self._execution_csv_path)
-        fills = _extract_unsettled_paper_fills(rows)
+        fills = _extract_unsettled_paper_fills(
+            rows,
+            fill_statuses=self._fill_statuses,
+            settle_statuses=self._settle_statuses,
+        )
         if not fills:
             return []
 
@@ -112,7 +121,7 @@ class PaperSettlementCoordinator:
                 side=fill.side,
                 price=fill.price,
                 size=fill.size,
-                status="paper_settle",
+                status=self._output_settle_status,
                 settlement_outcome=outcome,
                 pnl=pnl,
             )
@@ -170,11 +179,16 @@ def _read_csv_rows(path: Path) -> list[dict[str, str]]:
         return [dict(row) for row in csv.DictReader(fp)]
 
 
-def _extract_unsettled_paper_fills(rows: list[dict[str, str]]) -> list[_PaperFill]:
+def _extract_unsettled_paper_fills(
+    rows: list[dict[str, str]],
+    *,
+    fill_statuses: set[str],
+    settle_statuses: set[str],
+) -> list[_PaperFill]:
     settled_order_ids: set[str] = set()
     for row in rows:
         status = _normalize_status(row.get("status"))
-        if status != "paper_settle":
+        if status not in settle_statuses:
             continue
         order_id = _normalize_order_id(row.get("order_id"))
         if order_id:
@@ -183,7 +197,7 @@ def _extract_unsettled_paper_fills(rows: list[dict[str, str]]) -> list[_PaperFil
     fills: list[_PaperFill] = []
     for row in rows:
         status = _normalize_status(row.get("status"))
-        if status != "paper_fill":
+        if status not in fill_statuses:
             continue
 
         order_id = _normalize_order_id(row.get("order_id"))
@@ -227,6 +241,13 @@ def _extract_unsettled_paper_fills(rows: list[dict[str, str]]) -> list[_PaperFil
 
     fills.sort(key=lambda value: (value.timestamp, value.order_id))
     return fills
+
+
+def _normalize_status_set(values: tuple[str, ...], *, fallback: tuple[str, ...]) -> set[str]:
+    normalized = {_normalize_status(value) for value in values if _normalize_status(value)}
+    if normalized:
+        return normalized
+    return {_normalize_status(item) for item in fallback if _normalize_status(item)}
 
 
 def _paper_binary_pnl(

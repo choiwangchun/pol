@@ -80,6 +80,31 @@ class PolicyRuntimeWiringTests(unittest.TestCase):
         self.assertAlmostEqual(config.policy.exploration_epsilon, 0.1)
         self.assertAlmostEqual(config.policy.ucb_c, 1.5)
 
+    def test_policy_controller_is_opt_in_via_enable_flag(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            config = build_config(
+                mode=RuntimeMode.DRY_RUN,
+                binance_symbol="BTCUSDT",
+                market_slug=None,
+                tick_seconds=1.0,
+                max_ticks=1,
+                bankroll=1000.0,
+                edge_min=0.015,
+                edge_buffer=0.01,
+                kelly_fraction=0.25,
+                f_cap=0.05,
+                min_order_notional=5.0,
+                rv_fallback=0.55,
+                sigma_weight=1.0,
+                iv_override=None,
+                log_dir=Path(tmp_dir),
+                enable_websocket=False,
+                enable_policy_bandit=False,
+                policy_mode="shadow",
+            )
+        app = PM1HEdgeTraderApp(config)
+        self.assertIsNone(app._policy_controller)
+
     def test_report_action_for_paper_fill_notifies_policy_controller(self) -> None:
         config = self._build_config()
         app = PM1HEdgeTraderApp(config)

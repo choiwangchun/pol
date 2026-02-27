@@ -46,6 +46,7 @@
             <input id="minOrderNotional" type="number" min="0.1" step="0.1" value="0.3" />
           </div>
           <p class="muted">소액 계정 테스트용 권장값: f_cap 0.25, min_notional 0.3</p>
+          <p id="riskBanner" class="risk-banner"></p>
           <div class="checkbox-row">
             <label><input id="freshStart" type="checkbox" checked /> Fresh Start</label>
             <label><input id="disableWebsocket" type="checkbox" /> REST Only</label>
@@ -98,6 +99,7 @@
           <div class="actions">
             <button id="entryButton" class="btn accent">포지션 진입</button>
           </div>
+          <p id="entryValidationHint" class="muted"></p>
           <pre id="entryResult" class="result-box">아직 요청 없음</pre>
         </article>
       </section>

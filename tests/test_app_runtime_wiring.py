@@ -159,6 +159,7 @@ class AppRuntimeWiringTests(unittest.TestCase):
         config = self._build_config(mode=RuntimeMode.LIVE)
         app = PM1HEdgeTraderApp(config)
         self.assertIsInstance(app._execution_engine._adapter, PolymarketLiveExecutionAdapter)
+        self.assertIsNotNone(app._paper_settlement)
 
     def test_build_signal_uses_quote_token_context(self) -> None:
         config = self._build_config(mode=RuntimeMode.DRY_RUN)

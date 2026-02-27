@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import json
 import os
 from pathlib import Path
 from typing import Any, Mapping
+
+LOGGER = logging.getLogger("pm1h_edge_trader.runtime_state")
 
 
 class RuntimeStateManager:
@@ -46,10 +49,16 @@ def _load_json_object(path: Path) -> dict[str, Any]:
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("state_load_failed path=%s error=%s", path, exc)
         return {}
     if isinstance(payload, dict):
         return payload
+    LOGGER.warning(
+        "state_load_invalid_payload path=%s payload_type=%s",
+        path,
+        type(payload).__name__,
+    )
     return {}
 
 
@@ -63,4 +72,3 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         fp.flush()
         os.fsync(fp.fileno())
     os.replace(tmp_path, path)
-

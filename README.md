@@ -19,6 +19,12 @@ uv sync --python 3.11
 uv run --python 3.11 pm1h-edge-trader --help
 ```
 
+라이브 운영에서는 websocket 스트리밍 권장:
+
+```bash
+uv sync --python 3.11 --extra ws
+```
+
 한 사이클 dry-run:
 
 ```bash

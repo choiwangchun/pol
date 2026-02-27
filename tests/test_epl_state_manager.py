@@ -48,6 +48,20 @@ class RuntimeStateManagerTests(unittest.TestCase):
             self.assertAlmostEqual(loaded["cost_estimator"]["ema_cost"], 0.01)
             self.assertFalse((Path(tmp_dir) / "policy_state.json.tmp").exists())
 
+    def test_load_runtime_logs_warning_on_corrupt_state(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            state_dir = Path(tmp_dir)
+            runtime_path = state_dir / "runtime_state.json"
+            runtime_path.write_text("{bad json", encoding="utf-8")
+            manager = RuntimeStateManager(state_dir=state_dir)
+
+            with self.assertLogs("pm1h_edge_trader.runtime_state", level="WARNING") as captured:
+                payload = manager.load_runtime()
+
+            self.assertEqual(payload, {})
+            joined = "\n".join(captured.output)
+            self.assertIn("state_load_failed", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

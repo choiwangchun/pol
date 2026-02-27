@@ -737,8 +737,13 @@ class PM1HEdgeTraderApp:
                 cap=config.volatility.deribit_iv_cap,
             )
         self._policy_controller: PolicyBanditController | None = None
-        bandit_enabled = config.policy.enabled or config.policy.mode in {"shadow", "full"}
+        bandit_enabled = config.policy.enabled
         bandit_shadow_mode = config.policy.shadow_mode or config.policy.mode != "full"
+        if not bandit_enabled and config.policy.mode in {"shadow", "full"}:
+            LOGGER.info(
+                "policy_bandit_disabled enable_policy_bandit=false mode=%s",
+                config.policy.mode,
+            )
         if bandit_enabled:
             self._policy_controller = PolicyBanditController(
                 config=PolicyBanditConfig(
@@ -797,6 +802,8 @@ class PM1HEdgeTraderApp:
                 execution_csv_path=config.logging.execution_csv_path,
                 reporter=self._reporter,
                 resolver=resolver,
+                fill_statuses=("paper_fill",),
+                settle_statuses=("paper_settle",),
             )
             self._paper_result_tracker = PaperResultTracker(
                 initial_bankroll=config.risk.bankroll,
@@ -806,6 +813,17 @@ class PM1HEdgeTraderApp:
             self._paper_result_tracker = PaperResultTracker(
                 initial_bankroll=config.risk.bankroll,
                 result_json_path=config.logging.root_dir / "result.json",
+                fill_statuses=("live_fill",),
+                settle_statuses=("live_settle",),
+            )
+            resolver = PolymarketMarketResolutionResolver(
+                gamma_base_url=config.polymarket.gamma_base_url,
+                clob_rest_base_url=config.polymarket.clob_rest_base_url,
+            )
+            self._paper_settlement = PaperSettlementCoordinator(
+                execution_csv_path=config.logging.execution_csv_path,
+                reporter=self._reporter,
+                resolver=resolver,
                 fill_statuses=("live_fill",),
                 settle_statuses=("live_settle",),
             )

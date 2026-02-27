@@ -13,6 +13,11 @@ dependencies = [
     "web3>=6,<8",
 ]
 
+[project.optional-dependencies]
+ws = [
+    "websockets>=12,<16",
+]
+
 [project.scripts]
 pm1h-edge-trader = "pm1h_edge_trader.main:main"
 pm1h-manual-entry = "pm1h_edge_trader.manual_entry:main"

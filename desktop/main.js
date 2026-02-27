@@ -37,6 +37,94 @@ const runtimeState = {
   lastCommand: null,
 };
 
+function parseBooleanEnv(name) {
+  const raw = process.env[name];
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return null;
+}
+
+function resolveElectronSandboxEnabled() {
+  const envOverride = parseBooleanEnv("PM1H_ELECTRON_SANDBOX");
+  if (envOverride !== null) {
+    return envOverride;
+  }
+  // Keep development mode flexible, enforce stricter defaults for packaged builds.
+  return !!app.isPackaged;
+}
+
+function parseFiniteNumber(value, fallback) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return fallback;
+  }
+  return num;
+}
+
+function clampNumber(value, { min, max, fallback, integer = false }) {
+  let num = parseFiniteNumber(value, fallback);
+  num = Math.min(max, Math.max(min, num));
+  if (integer) {
+    num = Math.round(num);
+  }
+  return num;
+}
+
+function sanitizeStartConfig(config) {
+  const raw = config || {};
+  return {
+    mode: raw.mode === "live" ? "live" : "dry-run",
+    bankroll: clampNumber(raw.bankroll, {
+      min: 1,
+      max: 1_000_000_000,
+      fallback: 1000,
+    }),
+    tickSeconds: clampNumber(raw.tickSeconds, {
+      min: 0.2,
+      max: 60,
+      fallback: 1,
+    }),
+    maxTicks: clampNumber(raw.maxTicks, {
+      min: 0,
+      max: 100_000_000,
+      fallback: 0,
+      integer: true,
+    }),
+    fCap: clampNumber(raw.fCap, {
+      min: 0.01,
+      max: 1.0,
+      fallback: 0.25,
+    }),
+    minOrderNotional: clampNumber(raw.minOrderNotional, {
+      min: 0.1,
+      max: 100_000,
+      fallback: 0.3,
+    }),
+    freshStart: !!raw.freshStart,
+    disableWebsocket: !!raw.disableWebsocket,
+    enablePolicyBandit: !!raw.enablePolicyBandit,
+    policyShadowMode: !!raw.policyShadowMode,
+    policyExplorationEpsilon: clampNumber(raw.policyExplorationEpsilon, {
+      min: 0.0,
+      max: 1.0,
+      fallback: 0.05,
+    }),
+    policyUcbC: clampNumber(raw.policyUcbC, {
+      min: 0.0,
+      max: 20.0,
+      fallback: 1.0,
+    }),
+  };
+}
+
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
     return;
@@ -89,6 +177,8 @@ function loadEnvFile(filePath) {
 }
 
 function createWindow() {
+  const sandboxEnabled = resolveElectronSandboxEnabled();
+  console.info(`[pm1h-desktop] browser sandbox=${sandboxEnabled ? "enabled" : "disabled"}`);
   mainWindow = new BrowserWindow({
     width: 1420,
     height: 920,
@@ -99,7 +189,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: sandboxEnabled,
     },
   });
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
@@ -123,11 +213,8 @@ function pushLog(level, message) {
 }
 
 function buildBotCommand(config) {
-  const mode = config.mode === "live" ? "live" : "dry-run";
-  const bankroll = Number(config.bankroll || 1000);
-  const tickSeconds = Number(config.tickSeconds || 1);
-  const fCap = Number(config.fCap || 0.25);
-  const minOrderNotional = Number(config.minOrderNotional || 0.3);
+  const safe = sanitizeStartConfig(config);
+  const mode = safe.mode;
   const args = [
     "run",
     "--python",
@@ -138,33 +225,33 @@ function buildBotCommand(config) {
     "--mode",
     mode,
     "--bankroll",
-    String(bankroll),
+    String(safe.bankroll),
     "--tick-seconds",
-    String(tickSeconds),
+    String(safe.tickSeconds),
     "--f-cap",
-    String(fCap),
+    String(safe.fCap),
     "--min-order-notional",
-    String(minOrderNotional),
+    String(safe.minOrderNotional),
   ];
-  if (Number(config.maxTicks || 0) > 0) {
-    args.push("--max-ticks", String(Number(config.maxTicks)));
+  if (safe.maxTicks > 0) {
+    args.push("--max-ticks", String(safe.maxTicks));
   }
   if (mode === "live") {
     args.push("--hard-kill-on-daily-loss");
   }
-  if (config.freshStart) {
+  if (safe.freshStart) {
     args.push("--fresh-start");
   }
-  if (config.disableWebsocket) {
+  if (safe.disableWebsocket) {
     args.push("--disable-websocket");
   }
-  if (config.enablePolicyBandit) {
+  if (safe.enablePolicyBandit) {
     args.push("--enable-policy-bandit");
-    if (config.policyShadowMode) {
+    if (safe.policyShadowMode) {
       args.push("--policy-shadow-mode");
     }
-    args.push("--policy-exploration-epsilon", String(Number(config.policyExplorationEpsilon || 0.05)));
-    args.push("--policy-ucb-c", String(Number(config.policyUcbC || 1.0)));
+    args.push("--policy-exploration-epsilon", String(safe.policyExplorationEpsilon));
+    args.push("--policy-ucb-c", String(safe.policyUcbC));
   }
   return { command: "uv", args };
 }
@@ -432,7 +519,7 @@ ipcMain.handle("bot:start", async (_event, config) => {
   if (botProcess) {
     return { ok: false, error: "Bot process is already running." };
   }
-  const startConfig = { ...(config || {}) };
+  const startConfig = sanitizeStartConfig(config);
   if (startConfig.mode === "live") {
     const liveBalance = await refreshLiveBalanceCache({ force: true, emit: true });
     if (!liveBalance.ok || !liveBalance.result) {
@@ -532,9 +619,22 @@ ipcMain.handle("bot:stop", async () => {
 ipcMain.handle("bot:manual-entry", async (_event, payload) => {
   const mode = payload && payload.mode === "live" ? "live" : "dry-run";
   const direction = payload && payload.direction === "down" ? "down" : "up";
-  const usd = Number(payload?.usd || 0);
+  const usd = clampNumber(payload?.usd, {
+    min: 0,
+    max: 1_000_000,
+    fallback: 0,
+  });
   if (!(usd > 0)) {
     return { ok: false, error: "USD notional must be greater than 0." };
+  }
+  let price = null;
+  const rawPrice = payload?.price;
+  if (rawPrice !== null && rawPrice !== undefined && String(rawPrice).trim().length > 0) {
+    const parsedPrice = parseFiniteNumber(rawPrice, NaN);
+    if (!Number.isFinite(parsedPrice) || parsedPrice <= 0 || parsedPrice >= 1) {
+      return { ok: false, error: "Price must be in (0, 1)." };
+    }
+    price = parsedPrice;
   }
   const args = [
     "run",
@@ -552,8 +652,8 @@ ipcMain.handle("bot:manual-entry", async (_event, payload) => {
     "--log-dir",
     "logs",
   ];
-  if (payload?.price && Number(payload.price) > 0) {
-    args.push("--price", String(Number(payload.price)));
+  if (price !== null) {
+    args.push("--price", String(price));
   }
   if (payload?.disableWebsocket) {
     args.push("--disable-websocket");
