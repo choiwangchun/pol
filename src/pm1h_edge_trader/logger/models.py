@@ -24,6 +24,9 @@ class ExecutionLogRecord:
     price: float
     size: float
     status: str
+    reason: str | None = None
+    data_ready: bool | None = None
+    entry_block_reason: str | None = None
     settlement_outcome: str | None = None
     pnl: float | None = None
 
@@ -47,6 +50,9 @@ class ExecutionLogRecord:
             "price",
             "size",
             "status",
+            "reason",
+            "data_ready",
+            "entry_block_reason",
             "settlement_outcome",
             "pnl",
         ]
@@ -70,6 +76,9 @@ class ExecutionLogRecord:
             "price": self.price,
             "size": self.size,
             "status": self.status,
+            "reason": self.reason,
+            "data_ready": self.data_ready,
+            "entry_block_reason": self.entry_block_reason,
             "settlement_outcome": self.settlement_outcome,
             "pnl": self.pnl,
         }

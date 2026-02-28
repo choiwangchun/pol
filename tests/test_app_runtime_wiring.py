@@ -297,6 +297,8 @@ class AppRuntimeWiringTests(unittest.TestCase):
             tau_years=0.0001,
             sigma=0.5,
             decision=None,
+            data_ready=True,
+            entry_block_reason=None,
         )
 
         self.assertEqual(adapter.order_status(handle.order_id), OrderStatus.FILLED)

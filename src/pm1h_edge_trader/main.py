@@ -439,6 +439,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore prior executions.csv state and start result tracking from a clean vault snapshot.",
     )
+    parser.add_argument(
+        "--fresh-start-ignore-state",
+        action="store_true",
+        help="When used with --fresh-start, skip loading runtime/policy checkpoint state.",
+    )
     return parser
 
 
@@ -883,8 +888,11 @@ class PM1HEdgeTraderApp:
             await self._deactivate_market()
 
     async def _bootstrap_runtime(self) -> None:
-        if self._config.runtime_state.resume:
+        ignore_state = self._config.fresh_start and self._config.fresh_start_ignore_state
+        if self._config.runtime_state.resume and not ignore_state:
             self._load_checkpoint_state()
+        elif ignore_state:
+            LOGGER.info("fresh_start_ignore_state enabled: skipping runtime/policy checkpoint load")
         if self._paper_result_tracker is not None:
             if self._config.fresh_start:
                 LOGGER.info("fresh_start enabled: ignoring previous executions.csv state")
@@ -1378,6 +1386,8 @@ class PM1HEdgeTraderApp:
                 tau_years=tau_years,
                 sigma=sigma,
                 decision=decision,
+                data_ready=data_ready,
+                entry_block_reason=entry_block_reason,
             )
 
         self._log_tick_summary(
@@ -1391,6 +1401,8 @@ class PM1HEdgeTraderApp:
             selected_profile_id=selected_profile_id,
             applied_profile_id=applied_profile_id,
             arb_decision=arb_decision,
+            data_ready=data_ready,
+            entry_block_reason=entry_block_reason,
         )
         await self._reconcile_paper_settlements(now=now)
         self._maybe_checkpoint_state(now=now)
@@ -1943,6 +1955,8 @@ class PM1HEdgeTraderApp:
         tau_years: float,
         sigma: float,
         decision: DecisionOutcome | None,
+        data_ready: bool,
+        entry_block_reason: str | None,
     ) -> None:
         side_signal: IntentSignal | None = None
         if action.token_id is not None:
@@ -1970,6 +1984,9 @@ class PM1HEdgeTraderApp:
             price=side_signal.desired_price if side_signal and side_signal.desired_price is not None else 0.0,
             size=side_signal.size if side_signal is not None else 0.0,
             status=action.action_type.value,
+            reason=action.reason,
+            data_ready=data_ready,
+            entry_block_reason=entry_block_reason,
             settlement_outcome=None,
             pnl=None,
         )
@@ -2296,6 +2313,8 @@ class PM1HEdgeTraderApp:
         action_count: int,
         selected_profile_id: str,
         applied_profile_id: str,
+        data_ready: bool,
+        entry_block_reason: str | None,
     ) -> None:
         q_up = decision.q_up if decision is not None else 0.5
         if arb_decision is not None and arb_decision.should_trade:
@@ -2317,7 +2336,8 @@ class PM1HEdgeTraderApp:
                 "edge_up=%.4f edge_down=%.4f "
                 "kelly_up=%.4f kelly_down=%.4f notional_up=%.2f notional_down=%.2f "
                 "arb_active=%s ask_sum=%.4f arb_profit=%.4f "
-                "fee=%.6f actions=%s kill_switch=%s policy_selected=%s policy_applied=%s"
+                "fee=%.6f actions=%s kill_switch=%s data_ready=%s entry_block_reason=%s "
+                "policy_selected=%s policy_applied=%s"
             ),
             tick_count,
             q_up,
@@ -2336,6 +2356,8 @@ class PM1HEdgeTraderApp:
             fee_rate,
             action_count,
             self._execution_engine.kill_switch.active,
+            data_ready,
+            entry_block_reason or "-",
             selected_profile_id,
             applied_profile_id,
         )
@@ -2999,6 +3021,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         log_dir=args.log_dir,
         enable_websocket=not args.disable_websocket,
         fresh_start=args.fresh_start,
+        fresh_start_ignore_state=args.fresh_start_ignore_state,
         polymarket_live_auth=live_auth,
         resume=args.resume,
         state_dir=args.state_dir,

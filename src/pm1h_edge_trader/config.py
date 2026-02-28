@@ -194,6 +194,7 @@ class RuntimeStateConfig:
 class AppConfig:
     mode: RuntimeMode = RuntimeMode.DRY_RUN
     fresh_start: bool = False
+    fresh_start_ignore_state: bool = False
     polymarket: PolymarketConfig = field(default_factory=PolymarketConfig)
     polymarket_live_auth: PolymarketLiveAuthConfig = field(default_factory=PolymarketLiveAuthConfig)
     binance: BinanceConfig = field(default_factory=BinanceConfig)
@@ -277,6 +278,7 @@ def build_config(
     arb_fill_timeout_seconds: float = 15.0,
     cancel_orphan_orders: bool = False,
     fresh_start: bool = False,
+    fresh_start_ignore_state: bool = False,
     polymarket_live_auth: PolymarketLiveAuthConfig | None = None,
     resume: bool = True,
     state_dir: Path | None = None,
@@ -311,6 +313,7 @@ def build_config(
     return AppConfig(
         mode=mode,
         fresh_start=fresh_start,
+        fresh_start_ignore_state=fresh_start_ignore_state,
         polymarket=PolymarketConfig(market_slug=market_slug.strip() if market_slug else None),
         polymarket_live_auth=polymarket_live_auth or PolymarketLiveAuthConfig(),
         binance=BinanceConfig(symbol=binance_symbol.upper()),
