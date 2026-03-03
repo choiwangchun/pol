@@ -215,7 +215,9 @@ class BinanceUnderlyingAdapter:
             candle_open_time = _parse_timestamp(kline.get("t"))
             # Use kline close as a supplemental live price if trade stream is delayed.
             price = _to_float(kline.get("c"))
-            price_time = _parse_timestamp(kline.get("T")) or _utcnow()
+            # Kline close time (k.T) can be in the future for in-progress candles.
+            # Prefer event time to avoid false-positive clock drift safety triggers.
+            price_time = _parse_timestamp(event.get("E")) or _parse_timestamp(kline.get("T")) or _utcnow()
             await self._apply_update(
                 price=price,
                 price_time=price_time,

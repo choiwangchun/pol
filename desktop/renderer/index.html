@@ -49,7 +49,9 @@
           <p id="riskBanner" class="risk-banner"></p>
           <div class="checkbox-row">
             <label><input id="freshStart" type="checkbox" checked /> Fresh Start</label>
+            <label><input id="freshStartIgnoreState" type="checkbox" /> Ignore State</label>
             <label><input id="disableWebsocket" type="checkbox" /> REST Only</label>
+            <label><input id="manualUnlatch" type="checkbox" /> Manual Unlatch</label>
           </div>
           <div class="checkbox-row">
             <label><input id="enablePolicyBandit" type="checkbox" /> Policy Bandit</label>
@@ -124,7 +126,7 @@
       </section>
 
       <section class="workspace-grid">
-        <article class="panel large">
+        <article class="panel large panel-column">
           <div class="panel-head">
             <h2>열린 포지션</h2>
             <span id="openCount" class="pill">0</span>
@@ -147,13 +149,23 @@
           </div>
         </article>
 
-        <article class="panel large">
-          <div class="panel-head">
-            <h2>실시간 로그</h2>
-            <button id="clearLogButton" class="btn subtle">Clear</button>
-          </div>
-          <pre id="logPane" class="log-pane"></pre>
-        </article>
+        <div class="workspace-stack">
+          <article class="panel large panel-column">
+            <div class="panel-head">
+              <h2>실시간 로그</h2>
+              <button id="clearLogButton" class="btn subtle">Clear</button>
+            </div>
+            <pre id="logPane" class="log-pane"></pre>
+          </article>
+
+          <article class="panel large panel-column">
+            <div class="panel-head">
+              <h2>거래 히스토리</h2>
+              <span id="historyCount" class="pill">0</span>
+            </div>
+            <div id="historyList" class="history-list"></div>
+          </article>
+        </div>
       </section>
     </div>
 

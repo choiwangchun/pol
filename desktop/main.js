@@ -2,6 +2,8 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const { sanitizeStartConfig, buildBotCommand } = require("./lib/bot-command");
+const { parseExecutionsCsv } = require("./lib/executions");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
@@ -76,53 +78,6 @@ function clampNumber(value, { min, max, fallback, integer = false }) {
     num = Math.round(num);
   }
   return num;
-}
-
-function sanitizeStartConfig(config) {
-  const raw = config || {};
-  return {
-    mode: raw.mode === "live" ? "live" : "dry-run",
-    bankroll: clampNumber(raw.bankroll, {
-      min: 1,
-      max: 1_000_000_000,
-      fallback: 1000,
-    }),
-    tickSeconds: clampNumber(raw.tickSeconds, {
-      min: 0.2,
-      max: 60,
-      fallback: 1,
-    }),
-    maxTicks: clampNumber(raw.maxTicks, {
-      min: 0,
-      max: 100_000_000,
-      fallback: 0,
-      integer: true,
-    }),
-    fCap: clampNumber(raw.fCap, {
-      min: 0.01,
-      max: 1.0,
-      fallback: 0.25,
-    }),
-    minOrderNotional: clampNumber(raw.minOrderNotional, {
-      min: 0.1,
-      max: 100_000,
-      fallback: 0.3,
-    }),
-    freshStart: !!raw.freshStart,
-    disableWebsocket: !!raw.disableWebsocket,
-    enablePolicyBandit: !!raw.enablePolicyBandit,
-    policyShadowMode: !!raw.policyShadowMode,
-    policyExplorationEpsilon: clampNumber(raw.policyExplorationEpsilon, {
-      min: 0.0,
-      max: 1.0,
-      fallback: 0.05,
-    }),
-    policyUcbC: clampNumber(raw.policyUcbC, {
-      min: 0.0,
-      max: 20.0,
-      fallback: 1.0,
-    }),
-  };
 }
 
 function loadEnvFile(filePath) {
@@ -210,155 +165,6 @@ function pushLog(level, message) {
     logBuffer = logBuffer.slice(logBuffer.length - LOG_BUFFER_LIMIT);
   }
   sendToRenderer("bot:log", line);
-}
-
-function buildBotCommand(config) {
-  const safe = sanitizeStartConfig(config);
-  const mode = safe.mode;
-  const args = [
-    "run",
-    "--python",
-    "3.11",
-    "python",
-    "-m",
-    "pm1h_edge_trader.main",
-    "--mode",
-    mode,
-    "--bankroll",
-    String(safe.bankroll),
-    "--tick-seconds",
-    String(safe.tickSeconds),
-    "--f-cap",
-    String(safe.fCap),
-    "--min-order-notional",
-    String(safe.minOrderNotional),
-  ];
-  if (safe.maxTicks > 0) {
-    args.push("--max-ticks", String(safe.maxTicks));
-  }
-  if (mode === "live") {
-    args.push("--hard-kill-on-daily-loss");
-  }
-  if (safe.freshStart) {
-    args.push("--fresh-start");
-  }
-  if (safe.disableWebsocket) {
-    args.push("--disable-websocket");
-  }
-  if (safe.enablePolicyBandit) {
-    args.push("--enable-policy-bandit");
-    if (safe.policyShadowMode) {
-      args.push("--policy-shadow-mode");
-    }
-    args.push("--policy-exploration-epsilon", String(safe.policyExplorationEpsilon));
-    args.push("--policy-ucb-c", String(safe.policyUcbC));
-  }
-  return { command: "uv", args };
-}
-
-function parseCsvLine(line) {
-  const values = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i];
-    if (char === '"' && line[i + 1] === '"') {
-      current += '"';
-      i += 1;
-      continue;
-    }
-    if (char === '"') {
-      inQuotes = !inQuotes;
-      continue;
-    }
-    if (char === "," && !inQuotes) {
-      values.push(current);
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  values.push(current);
-  return values;
-}
-
-function parseExecutionsCsv(filePath) {
-  if (!fs.existsSync(filePath)) {
-    return {
-      totalRows: 0,
-      openPositions: [],
-      recentEvents: [],
-    };
-  }
-  const text = fs.readFileSync(filePath, "utf-8");
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line) => line.length > 0);
-  if (lines.length <= 1) {
-    return {
-      totalRows: 0,
-      openPositions: [],
-      recentEvents: [],
-    };
-  }
-
-  const headers = parseCsvLine(lines[0]);
-  const rows = [];
-  for (let i = 1; i < lines.length; i += 1) {
-    const raw = parseCsvLine(lines[i]);
-    const row = {};
-    headers.forEach((header, idx) => {
-      row[header] = raw[idx] ?? "";
-    });
-    rows.push(row);
-  }
-
-  const unsettled = new Map();
-  rows.forEach((row) => {
-    const status = String(row.status || "").toLowerCase();
-    const orderId = String(row.order_id || "").trim();
-    if (!orderId || orderId === "-") {
-      return;
-    }
-    if (status === "paper_fill" || status === "live_fill") {
-      unsettled.set(orderId, row);
-      return;
-    }
-    if (status === "paper_settle" || status === "live_settle") {
-      unsettled.delete(orderId);
-    }
-  });
-
-  const openPositions = Array.from(unsettled.values())
-    .map((row) => ({
-      timestamp: row.timestamp || "",
-      marketId: row.market_id || "",
-      orderId: row.order_id || "",
-      side: row.side || "",
-      price: Number(row.price || 0),
-      size: Number(row.size || 0),
-      notional: Number(row.price || 0) * Number(row.size || 0),
-      status: row.status || "",
-    }))
-    .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
-
-  const recentEvents = rows
-    .slice(Math.max(0, rows.length - 20))
-    .map((row) => ({
-      timestamp: row.timestamp || "",
-      orderId: row.order_id || "",
-      side: row.side || "",
-      status: row.status || "",
-      pnl: row.pnl || "",
-    }))
-    .reverse();
-
-  return {
-    totalRows: rows.length,
-    openPositions,
-    recentEvents,
-  };
 }
 
 function readResultJson(filePath) {

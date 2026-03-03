@@ -5,6 +5,8 @@ const winRate = document.getElementById("winRate");
 const unsettledNotional = document.getElementById("unsettledNotional");
 const openCount = document.getElementById("openCount");
 const openPositionsBody = document.getElementById("openPositionsBody");
+const historyCount = document.getElementById("historyCount");
+const historyList = document.getElementById("historyList");
 const logPane = document.getElementById("logPane");
 const entryResult = document.getElementById("entryResult");
 const commandPreview = document.getElementById("commandPreview");
@@ -127,6 +129,102 @@ function renderRows(openPositions) {
   });
 }
 
+function formatHistoryTime(value) {
+  if (!value) {
+    return "-";
+  }
+  const raw = String(value);
+  const utc = Date.parse(raw);
+  if (!Number.isFinite(utc)) {
+    return raw.replace("T", " ").slice(0, 19);
+  }
+  const diffSeconds = Math.round((Date.now() - utc) / 1000);
+  if (diffSeconds < 60) {
+    return `${Math.max(1, diffSeconds)}초 전`;
+  }
+  if (diffSeconds < 3600) {
+    return `${Math.floor(diffSeconds / 60)}분 전`;
+  }
+  if (diffSeconds < 86400) {
+    return `${Math.floor(diffSeconds / 3600)}시간 전`;
+  }
+  return `${Math.floor(diffSeconds / 86400)}일 전`;
+}
+
+function formatHistoryPrice(price) {
+  const cents = Math.round(Number(price || 0) * 100);
+  return `${cents}¢`;
+}
+
+function formatHistoryPnl(item) {
+  if (item.action === "buy") {
+    return {
+      text: money(-(item.notional || 0)),
+      className: "negative",
+    };
+  }
+  const pnl = Number(item.pnl || 0);
+  if (Math.abs(pnl) < 1e-12) {
+    return { text: "-", className: "" };
+  }
+  return {
+    text: pnl > 0 ? `+${money(pnl)}` : money(pnl),
+    className: pnl > 0 ? "positive" : "negative",
+  };
+}
+
+function renderHistory(history) {
+  historyList.innerHTML = "";
+  if (!Array.isArray(history) || history.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "히스토리 없음";
+    historyList.appendChild(empty);
+    return;
+  }
+
+  history.slice(0, 80).forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "history-item";
+
+    const action = document.createElement("span");
+    const isSell = item.action === "sell";
+    action.className = `history-action ${isSell ? "sell" : "buy"}`;
+    action.textContent = isSell ? "판매됨" : "구입함";
+
+    const main = document.createElement("div");
+    main.className = "history-main";
+    const title = document.createElement("div");
+    title.className = "history-title";
+    title.textContent = item.marketId || "-";
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    meta.textContent = `${String(item.side || "").toUpperCase()} ${formatHistoryPrice(item.price)} · ${Number(item.size || 0).toFixed(2)}주`;
+    main.appendChild(title);
+    main.appendChild(meta);
+
+    const right = document.createElement("div");
+    right.className = "history-right";
+    const pnl = document.createElement("div");
+    pnl.className = "history-pnl";
+    const pnlData = formatHistoryPnl(item);
+    pnl.textContent = pnlData.text;
+    if (pnlData.className) {
+      pnl.classList.add(pnlData.className);
+    }
+    const time = document.createElement("div");
+    time.className = "history-time";
+    time.textContent = formatHistoryTime(item.timestamp);
+    right.appendChild(pnl);
+    right.appendChild(time);
+
+    row.appendChild(action);
+    row.appendChild(main);
+    row.appendChild(right);
+    historyList.appendChild(row);
+  });
+}
+
 function appendLog(line) {
   const existing = logPane.textContent.split("\n").filter((item) => item.length > 0);
   existing.push(line);
@@ -163,6 +261,9 @@ function renderSnapshot(snapshot) {
   const openPositions = executions.openPositions || [];
   openCount.textContent = String(openPositions.length);
   renderRows(openPositions);
+  const history = executions.history || [];
+  historyCount.textContent = String(history.length);
+  renderHistory(history);
 
   const logs = Array.isArray(snapshot.logs) ? snapshot.logs : [];
   if (logs.length > 0) {
@@ -207,7 +308,9 @@ function collectStartConfig() {
     fCap,
     minOrderNotional,
     freshStart: document.getElementById("freshStart").checked,
+    freshStartIgnoreState: document.getElementById("freshStartIgnoreState").checked,
     disableWebsocket: document.getElementById("disableWebsocket").checked,
+    manualUnlatch: document.getElementById("manualUnlatch").checked,
     enablePolicyBandit: document.getElementById("enablePolicyBandit").checked,
     policyShadowMode: document.getElementById("policyShadowMode").checked,
     policyExplorationEpsilon,
@@ -229,9 +332,15 @@ function collectStartConfig() {
   }
   if (config.freshStart) {
     parts.push("--fresh-start");
+    if (config.freshStartIgnoreState) {
+      parts.push("--fresh-start-ignore-state");
+    }
   }
   if (config.disableWebsocket) {
     parts.push("--disable-websocket");
+  }
+  if (config.manualUnlatch) {
+    parts.push("--manual-unlatch");
   }
   if (config.enablePolicyBandit) {
     parts.push("--enable-policy-bandit");
@@ -373,7 +482,9 @@ clearLogButton.addEventListener("click", () => {
   "fCap",
   "minOrderNotional",
   "freshStart",
+  "freshStartIgnoreState",
   "disableWebsocket",
+  "manualUnlatch",
   "enablePolicyBandit",
   "policyShadowMode",
   "policyExplorationEpsilon",
